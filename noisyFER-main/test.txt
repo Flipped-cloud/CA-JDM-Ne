@@ -1,6 +1,0 @@
-import sys
-import os
-
-# 获取项目根目录（noisyFER-main的路径）
-root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(root_path)  # 把根目录加入搜索路径
