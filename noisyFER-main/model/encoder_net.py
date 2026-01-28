@@ -1,25 +1,24 @@
-import functools
 import torch
 import torch.nn as nn
-from collections import OrderedDict
-import torch.nn.functional as F
 import math
-from model.attention import CCAM, SCAM  # 导入协同注意力模块
+# 修改导入路径：假设所有文件在同一目录下
+from attention import CCAM, SCAM  
 
 class Encoder(nn.Module):
-    def __init__(self, img_size=256, fc_layer=512, latent_dim=10, noise_dim=100):
+    def __init__(self, img_size=224, fc_layer=512, latent_dim=10, noise_dim=100):
         super(Encoder, self).__init__()
         self.fc_layer = fc_layer
         self.latent_dim = latent_dim
         self.noise_dim = noise_dim
         
-        # 计算最终的特征图大小
+        # --- 修改点：适配 224x224 输入 ---
         if img_size == 256: self.final_size = 8
+        elif img_size == 224: self.final_size = 7  # 224 -> 112 -> 56 -> 28 -> 14 -> 7
         elif img_size == 128: self.final_size = 4
         elif img_size == 96: self.final_size = 3
         elif img_size == 64: self.final_size = 2
         elif img_size == 32: self.final_size = 1
-        else: raise ValueError("Unsupported img_size")
+        else: raise ValueError(f"Unsupported img_size: {img_size}")
 
         # =====================================================================
         # Stage 1 (Input -> /2)
@@ -166,12 +165,4 @@ class Encoder(nn.Module):
         # 2. Landmarks (From Landmark Stream)
         pred_landmarks = self.landmark_layer(l_flat) # [B, 136]
 
-        # 返回5个值，比原来多了一个 pred_landmarks
         return mean, logvar, z0, z1, pred_landmarks
-
-    # 保留此函数以防原来的代码在某处调用它，但双流结构下加载单流VGG权重可能需要手动匹配
-    def init_vggface_params(self, pretrained_model_path):
-        print("Warning: Loading pretrained VGG weights into Dual-Stream Encoder is complex.")
-        print("Initializing weights from scratch or skipping this step is recommended for now.")
-        # 如果必须加载，需要编写复杂的 key mapping 逻辑 (conv_block1 -> conv_block1_f & conv_block1_l)
-        pass

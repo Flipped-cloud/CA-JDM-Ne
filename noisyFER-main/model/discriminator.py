@@ -201,21 +201,3 @@ class Discriminator_joint(nn.Module):
         res = self.z_x_mlp(joint_feat)  # [bs, 1024]
         s_x_z = self.score_x_z(res)
         return s_x_z
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
