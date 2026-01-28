@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-import math
-# 修改导入路径：假设所有文件在同一目录下
-from attention import CCAM, SCAM  
+from .attention import CCAM, SCAM
 
 class Encoder(nn.Module):
     def __init__(self, img_size=224, fc_layer=512, latent_dim=10, noise_dim=100):
@@ -66,10 +64,10 @@ class Encoder(nn.Module):
         self.embedding = nn.Sequential(
             nn.Linear(512 * self.final_size * self.final_size, self.fc_layer),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(0.5),
+            nn.Dropout(0.5),
             nn.Linear(self.fc_layer, self.fc_layer),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(0.5),
+            nn.Dropout(0.5),
         )
         self.mean_layer = nn.Linear(self.fc_layer, self.noise_dim)
         self.logvar_layer = nn.Linear(self.fc_layer, self.noise_dim)
@@ -78,13 +76,11 @@ class Encoder(nn.Module):
         # =====================================================================
         # Landmark Head (New Output)
         # =====================================================================
-        # 输入: Landmark Stream 的 Flatten 特征
-        # 输出: 68个点 * 2坐标 = 136
         self.landmark_layer = nn.Sequential(
             nn.Linear(512 * self.final_size * self.final_size, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(1024, 136) 
+            nn.Linear(1024, 136)
         )
 
         self._init_weights()
@@ -103,16 +99,16 @@ class Encoder(nn.Module):
         return nn.Sequential(*block)
 
     def _init_weights(self):
+        # He init for conv/linear
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
-                    m.bias.data.zero_()
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
-                    m.bias.data.zero_()
+                    nn.init.zeros_(m.bias)
 
     def sample_z(self, z_mu, z_logvar):
         z_std = torch.exp(0.5 * z_logvar)
@@ -155,14 +151,11 @@ class Encoder(nn.Module):
         l_flat = l5.view(l5.shape[0], -1)
 
         # ---------------- Output Heads ----------------
-        # 1. Emotion & Latent Codes (From Face Stream)
         embedding = self.embedding(f_flat)
         mean = self.mean_layer(embedding)
         logvar = self.logvar_layer(embedding)
-        z0 = self.sample_z(mean, logvar) # Noise vector
-        z1 = self.c_layer(embedding)     # Predicted Emotion Label
-
-        # 2. Landmarks (From Landmark Stream)
-        pred_landmarks = self.landmark_layer(l_flat) # [B, 136]
+        z0 = self.sample_z(mean, logvar)          # noise vector
+        z1 = self.c_layer(embedding)              # emotion logits
+        pred_landmarks = self.landmark_layer(l_flat)  # [B,136]
 
         return mean, logvar, z0, z1, pred_landmarks
