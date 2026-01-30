@@ -90,7 +90,10 @@ class Discriminator_lbl(nn.Module):
         else:
             # soft labels / onehot: (B,C) -> weighted sum of embedding vectors
             # embedding.weight: (C, out_channels)
-            feat = torch.matmul(z, self.embedding.weight)
+            w = self.embedding.weight
+            if w.device != z.device:
+                w = w.to(z.device)
+            feat = torch.matmul(z, w)
 
         feat = self.mlp(feat)
         s = self.head(feat)

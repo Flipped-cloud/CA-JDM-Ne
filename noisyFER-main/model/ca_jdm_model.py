@@ -40,7 +40,7 @@ class CAJDMNetModel(BaseModel):
 
     def __init__(self, args):
         super(CAJDMNetModel, self).initialize(args)
-        self.device = device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.n_classes = args.num_classes
         self.landmark_dim = args.num_landmarks * 2
@@ -51,20 +51,22 @@ class CAJDMNetModel(BaseModel):
             fc_layer=self.args.fc_layer,
             latent_dim=self.latent_dim,
             noise_dim=self.args.noise_dim,
-        ).to(device)
+            e_ratio=getattr(self.args, "e_ratio", 0.2),
+            scam_kernel=getattr(self.args, "scam_kernel", 7),
+        ).to(self.device)
 
         if self.args.img_size == 64:
             self.decoder = Decoder_64(
                 img_size=self.args.img_size,
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
-            ).to(device)
+            ).to(self.device)
         elif self.args.img_size == 128:
             self.decoder = Decoder_128(
                 img_size=self.args.img_size,
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
-            ).to(device)
+            ).to(self.device)
         else:
             raise ValueError("Only img_size 64 or 128 supported for CA-JDM-Net decoder.")
 
@@ -82,19 +84,19 @@ class CAJDMNetModel(BaseModel):
             # x / z0 / z1(emo) / lm / joint
             self.discriminator_x = Discriminator_x(
                 img_size=self.args.img_size, out_channels=512, wide=True, with_sx=True, early_xfeat=False
-            ).to(device)
+            ).to(self.device)
             self.discriminator_z0 = Discriminator_z0(
                 in_channels=self.args.noise_dim, out_channels=512
-            ).to(device)
+            ).to(self.device)
             self.discriminator_emo = Discriminator_lbl(
                 in_channels=self.n_classes, out_channels=512, use_embedding=True
-            ).to(device)
+            ).to(self.device)
             self.discriminator_lmk = Discriminator_lmk(
                 in_channels=self.landmark_dim, out_channels=512
-            ).to(device)
+            ).to(self.device)
             self.discriminator_joint_xz = Discriminator_joint(
                 in_channels=512 * 3
-            ).to(device)
+            ).to(self.device)
 
             self.optimizer_G = torch.optim.Adam(
                 filter(lambda p: p.requires_grad, itertools.chain(self.encoder.parameters(), self.decoder.parameters())),
@@ -116,18 +118,16 @@ class CAJDMNetModel(BaseModel):
                 betas=(0.5, 0.999),
             )
 
-            self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(device)
-            self.criterion_recon = torch.nn.L1Loss().to(device)
+            self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(self.device)
+            self.criterion_recon = torch.nn.L1Loss().to(self.device)
 
     def set_input(self, data):
-        self.img = data[0].to(device)
-        self.exp_lbl = data[1].to(device)
-        self.landmarks = data[2].to(device)
+        self.img = data[0].to(self.device)
+        self.exp_lbl = data[1].to(self.device)
+        self.landmarks = data[2].to(self.device)
 
         self.batch_size = self.img.shape[0]
-
-        # make onehot for "real" emotion distribution
-        self.exp_lbl_onehot = torch.zeros(self.batch_size, self.n_classes, device=device)
+        self.exp_lbl_onehot = torch.zeros(self.batch_size, self.n_classes, device=self.device)
         self.exp_lbl_onehot.scatter_(1, self.exp_lbl.view(-1, 1), 1.0)
 
     def forward_G(self, epoch):
@@ -150,7 +150,7 @@ class CAJDMNetModel(BaseModel):
         self.loss_recon = self.criterion_recon(self.dec_img, self.img)
 
         # adversarial (only after gan_start_epoch)
-        self.loss_gan = torch.tensor(0.0, device=device)
+        self.loss_gan = torch.tensor(0.0, device=self.device)
 
         if epoch >= self.args.gan_start_epoch:
             # ---- marginal x: real img vs fake reconstructed img ----

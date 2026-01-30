@@ -6,7 +6,7 @@ from PIL import Image
 from torch.utils import data
 from torchvision import transforms as T
 
-import joint_transforms
+from . import joint_transforms
 
 
 class AffectNetDataset_Fusion(data.Dataset):

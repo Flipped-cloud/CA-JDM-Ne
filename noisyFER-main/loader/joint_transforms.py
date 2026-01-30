@@ -92,14 +92,15 @@ class RandomHorizontalFlip(object):
             
             # 2. 关键点坐标数学翻转
             landmarks = landmarks.clone()
-            landmarks[0::2] = w - landmarks[0::2]
+            # 建议用 (w - 1) - x，更符合像素坐标系（可选但推荐）
+            landmarks[0::2] = (w - 1) - landmarks[0::2]
             
             # 3. 关键点语义索引交换 (Semantic Index Swapping)
             # 这一步对于 68 点至关重要！
             # 将 Tensor 转为 Reshape 后的列表方便操作 [68, 2]
             lmk_reshaped = landmarks.view(-1, 2)
             new_lmk = lmk_reshaped.clone()
-            
+
             for i in range(68):
                 if i in self.flip_map:
                     # 如果该点有对称点，取对称点的坐标
@@ -125,3 +126,4 @@ class Normalize(object):
 
     def __call__(self, image, landmarks):
         image = F.normalize(image, self.mean, self.std)
+        return image, landmarks  # <-- 关键：必须返回

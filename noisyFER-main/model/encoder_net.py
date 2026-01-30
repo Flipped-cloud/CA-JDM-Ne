@@ -3,7 +3,7 @@ import torch.nn as nn
 from .attention import CCAM, SCAM
 
 class Encoder(nn.Module):
-    def __init__(self, img_size=224, fc_layer=512, latent_dim=10, noise_dim=100):
+    def __init__(self, img_size=224, fc_layer=512, latent_dim=10, noise_dim=100, e_ratio=0.2, scam_kernel=7):
         super(Encoder, self).__init__()
         self.fc_layer = fc_layer
         self.latent_dim = latent_dim
@@ -23,40 +23,40 @@ class Encoder(nn.Module):
         # =====================================================================
         self.conv_block1_f = self._make_block(3, 64)   # Face Stream
         self.conv_block1_l = self._make_block(3, 64)   # Landmark Stream
-        self.ccam1 = CCAM(64)
-        self.scam1 = SCAM(64)
+        self.ccam1 = CCAM(64, e_ratio=e_ratio)
+        self.scam1 = SCAM(64, kernel_size=scam_kernel)
 
         # =====================================================================
         # Stage 2 (/2 -> /4)
         # =====================================================================
         self.conv_block2_f = self._make_block(64, 128)
         self.conv_block2_l = self._make_block(64, 128)
-        self.ccam2 = CCAM(128)
-        self.scam2 = SCAM(128)
+        self.ccam2 = CCAM(128, e_ratio=e_ratio)
+        self.scam2 = SCAM(128, kernel_size=scam_kernel)
 
         # =====================================================================
         # Stage 3 (/4 -> /8)
         # =====================================================================
         self.conv_block3_f = self._make_block(128, 256, layers=3)
         self.conv_block3_l = self._make_block(128, 256, layers=3)
-        self.ccam3 = CCAM(256)
-        self.scam3 = SCAM(256)
+        self.ccam3 = CCAM(256, e_ratio=e_ratio)
+        self.scam3 = SCAM(256, kernel_size=scam_kernel)
 
         # =====================================================================
         # Stage 4 (/8 -> /16)
         # =====================================================================
         self.conv_block4_f = self._make_block(256, 512, layers=3)
         self.conv_block4_l = self._make_block(256, 512, layers=3)
-        self.ccam4 = CCAM(512)
-        self.scam4 = SCAM(512)
+        self.ccam4 = CCAM(512, e_ratio=e_ratio)
+        self.scam4 = SCAM(512, kernel_size=scam_kernel)
 
         # =====================================================================
         # Stage 5 (/16 -> /32)
         # =====================================================================
         self.conv_block5_f = self._make_block(512, 512, layers=3)
         self.conv_block5_l = self._make_block(512, 512, layers=3)
-        self.ccam5 = CCAM(512)
-        self.scam5 = SCAM(512)
+        self.ccam5 = CCAM(512, e_ratio=e_ratio)
+        self.scam5 = SCAM(512, kernel_size=scam_kernel)
 
         # =====================================================================
         # Face Head (Emotion & Latent Codes)

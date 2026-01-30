@@ -7,6 +7,7 @@ sys.path.append(root_path)  # 把根目录加入搜索路径
 
 import torch
 import time
+import numpy as np
 from tqdm import tqdm
 import argparse
 from loader.dataloader_cifar10_multi import DataloaderCifar10_MultiLabel
@@ -27,6 +28,8 @@ parser.add_argument("--val_step", default=200, type=int)
 parser.add_argument("--save_step", default=400, type=int)
 parser.add_argument("--num_epoch", default=100000, type=int)
 parser.add_argument("--isTrain", default=True, type=bool)
+parser.add_argument("--early_stop_patience", default=7, type=int)
+parser.add_argument("--seed", default=42, type=int)
 
 
 parser.add_argument("--fc_layer", default=512, type=int)
@@ -55,23 +58,44 @@ args = parser.parse_args()
 ###################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 def train(writer, logger):
+    g = torch.Generator()
+    g.manual_seed(args.seed)
     train_dataset = DataloaderCifar10_MultiLabel(img_size=args.img_size, is_transform=True, split='train',
                                                  noise_ratio_list=[0.2, 0.3, 0.4])
     train_dataset.load_data(args.root)
     train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                   num_workers=8)
+                                                   num_workers=8, worker_init_fn=seed_worker, generator=g)
 
     val_dataset = DataloaderCifar10_MultiLabel(img_size=args.img_size, is_transform=False, split='test')
     val_dataset.load_data(args.root)
     val_dataloader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
-                                                 num_workers=2)
+                                                 num_workers=2, worker_init_fn=seed_worker, generator=g)
 
     model = InconsistLabelModel(args)
     model.setup()
     time_meter = averageMeter()
 
     total_steps = 0
+    best_acc = -1.0
+    best_epoch = -1
+    should_stop = False
     for epoch in range(args.num_epoch):
         for step, data in tqdm(enumerate(train_dataloader)):
             start_ts = time.time()
@@ -129,11 +153,28 @@ def train(writer, logger):
                     writer.add_scalar('val/acc', acc, total_steps)
                     print('acc:', acc)
 
+                if acc > best_acc:
+                    best_acc = acc
+                    best_epoch = epoch
+                    model.save_networks('best', writer.file_writer.get_logdir())
+                    logger.info(f"[*] best models saved. acc: {best_acc:.2f} @ epoch {best_epoch}")
+                elif best_epoch >= 0 and (epoch - best_epoch) >= args.early_stop_patience:
+                    logger.info(
+                        f"Early stopping: acc not improved for {args.early_stop_patience} epochs."
+                    )
+                    should_stop = True
+
                 if total_steps % args.save_step == 0:
                     save_suffix = 'last'
                     model.save_networks(save_suffix, writer.file_writer.get_logdir())
                     print("[*] models saved.")
                     logger.info("[*] models saved.")
+
+                if should_stop:
+                    break
+
+        if should_stop:
+            break
 
 
         if epoch == args.num_epoch:
@@ -141,6 +182,7 @@ def train(writer, logger):
 
 
 if __name__ == '__main__':
+    seed_everything(args.seed)
     run_id = random.randint(1, 100000)
     logdir = os.path.join(args.save_dir, str(run_id))  # create new path
     writer = SummaryWriter(log_dir=logdir)
