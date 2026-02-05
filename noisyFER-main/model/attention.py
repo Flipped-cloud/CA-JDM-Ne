@@ -4,6 +4,144 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ============================================================================
+# CMCNN-style Attention Modules (from CBAM)
+# ============================================================================
+
+class ChannelAttention(nn.Module):
+    """
+    Channel Attention Module (from CBAM/CMCNN)
+    Reference: https://github.com/luuuyi/CBAM.PyTorch
+    
+    使用全局平均池化和最大池化来生成通道注意力权重
+    """
+    def __init__(self, in_channels, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # x: (B, C, H, W)
+        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)  # (B, C, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    """
+    Spatial Attention Module (from CBAM/CMCNN)
+    Reference: https://github.com/luuuyi/CBAM.PyTorch
+    
+    使用通道维度的平均池化和最大池化来生成空间注意力权重
+    """
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        self.bn = nn.BatchNorm2d(1)
+        
+    def forward(self, x):
+        # x: (B, C, H, W)
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        x_cat = torch.cat([avg_out, max_out], dim=1)  # (B, 2, H, W)
+        x_cat = self.conv1(x_cat)
+        x_cat = self.bn(x_cat)
+        return self.sigmoid(x_cat)  # (B, 1, H, W)
+
+
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module (CBAM)
+    结合通道注意力和空间注意力的完整模块
+    
+    使用方式: 
+    x_att = x + CBAM(x)  # 残差连接
+    或
+    x_att = x * CBAM(x)  # 直接加权
+    """
+    def __init__(self, in_channels, reduction=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_channels, reduction)
+        self.sa = SpatialAttention(kernel_size)
+        
+    def forward(self, x):
+        # Channel attention
+        x = x * self.ca(x)
+        # Spatial attention
+        x = x * self.sa(x)
+        return x
+
+
+# ============================================================================
+# Coordinate Attention (CA)
+# Reference: Coordinate Attention for Efficient Mobile Network Design
+# ============================================================================
+
+class HSwish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relu6 = nn.ReLU6(inplace=True)
+
+    def forward(self, x):
+        return x * self.relu6(x + 3) / 6
+
+
+class CoordAtt(nn.Module):
+    """
+    Coordinate Attention Module
+    Generates direction-aware attention maps along H and W.
+    """
+    def __init__(self, in_channels, reduction=32):
+        super().__init__()
+        self.in_channels = in_channels
+        self.reduction = reduction
+        mid_channels = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.act = HSwish()
+
+        self.conv_h = nn.Conv2d(mid_channels, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv_w = nn.Conv2d(mid_channels, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, x):
+        identity = x
+        b, c, h, w = x.size()
+
+        # Coordinate information embedding
+        x_h = x.mean(dim=3, keepdim=True)  # (B, C, H, 1)
+        x_w = x.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)  # (B, C, 1, W)
+
+        y = torch.cat([x_h, x_w], dim=2)  # (B, C, H+W, 1)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+
+        out = identity * a_h * a_w
+        return out
+
+
+# ============================================================================
+# Co-Attention Modules (for multi-stream architectures)
+# ============================================================================
+
 class CCAM(nn.Module):
     """
     Channel Correlation Attention Module (CCAM)

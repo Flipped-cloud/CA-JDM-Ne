@@ -34,8 +34,10 @@ class RAFDataset_Fusion(data.Dataset):
                     [
                         JT.Resize((args.img_size, args.img_size)),
                         JT.RandomHorizontalFlip(p=0.5),
+                        JT.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Add ColorJitter
                         JT.ToTensor(),
                         JT.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                        JT.RandomErasing(p=0.5),
                     ]
                 )
             else:

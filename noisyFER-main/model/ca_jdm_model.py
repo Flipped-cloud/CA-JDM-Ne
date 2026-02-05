@@ -10,8 +10,8 @@ root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(root_path)
 
 from model.base_model import BaseModel
-from model.encoder_net import Encoder
-from model.decoder_net import Decoder_64, Decoder_128
+from model.encoder_net import Encoder, IR50_Encoder
+from model.decoder_net import Decoder_64, Decoder_112, Decoder_128, Decoder_224
 from model.discriminator import (
     Discriminator_x,
     Discriminator_lbl,
@@ -31,6 +31,21 @@ def hinge_d(real_scores, fake_scores):
     return loss_real + loss_fake
 
 
+class LabelSmoothingCrossEntropy(torch.nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+
+    def forward(self, x, target):
+        logprobs = F.log_softmax(x, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
 def hinge_g(fake_scores):
     return -torch.mean(fake_scores)
 
@@ -46,17 +61,35 @@ class CAJDMNetModel(BaseModel):
         self.landmark_dim = args.num_landmarks * 2
         self.latent_dim = self.n_classes
 
-        self.encoder = Encoder(
-            img_size=self.args.img_size,
-            fc_layer=self.args.fc_layer,
-            latent_dim=self.latent_dim,
-            noise_dim=self.args.noise_dim,
-            e_ratio=getattr(self.args, "e_ratio", 0.2),
-            scam_kernel=getattr(self.args, "scam_kernel", 7),
-        ).to(self.device)
+        # Choose encoder based on backbone argument
+        if getattr(args, 'backbone', 'vgg') == 'ir50':
+            self.encoder = IR50_Encoder(
+                img_size=self.args.img_size,
+                fc_layer=self.args.fc_layer,
+                latent_dim=self.latent_dim,
+                noise_dim=self.args.noise_dim,
+                use_dual_stream=getattr(self.args, "use_dual_stream", True),
+                use_ca=getattr(self.args, "use_ca", False),
+            ).to(self.device)
+        else:
+            # Legacy VGG-style encoder
+            self.encoder = Encoder(
+                img_size=self.args.img_size,
+                fc_layer=self.args.fc_layer,
+                latent_dim=self.latent_dim,
+                noise_dim=self.args.noise_dim,
+                e_ratio=getattr(self.args, "e_ratio", 0.2),
+                scam_kernel=getattr(self.args, "scam_kernel", 7),
+            ).to(self.device)
 
         if self.args.img_size == 64:
             self.decoder = Decoder_64(
+                img_size=self.args.img_size,
+                latent_dim=self.latent_dim + self.landmark_dim,
+                noise_dim=self.args.noise_dim,
+            ).to(self.device)
+        elif self.args.img_size == 112:
+            self.decoder = Decoder_112(
                 img_size=self.args.img_size,
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
@@ -67,8 +100,14 @@ class CAJDMNetModel(BaseModel):
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
             ).to(self.device)
+        elif self.args.img_size == 224:
+            self.decoder = Decoder_224(
+                img_size=self.args.img_size,
+                latent_dim=self.latent_dim + self.landmark_dim,
+                noise_dim=self.args.noise_dim,
+            ).to(self.device)
         else:
-            raise ValueError("Only img_size 64 or 128 supported for CA-JDM-Net decoder.")
+            raise ValueError("Only img_size 64/112/128/224 supported for CA-JDM-Net decoder.")
 
         if self.args.isTrain:
             self.train_model_name = [
@@ -98,12 +137,16 @@ class CAJDMNetModel(BaseModel):
                 in_channels=512 * 3
             ).to(self.device)
 
-            self.optimizer_G = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, itertools.chain(self.encoder.parameters(), self.decoder.parameters())),
+            self.optimizer_G = torch.optim.AdamW(
+                [
+                    {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": self.args.lr * 0.1},
+                    {"params": [p for n, p in self.decoder.named_parameters() if p.requires_grad], "lr": self.args.lr},
+                ],
                 lr=self.args.lr,
-                betas=(0.5, 0.999),
+                betas=(0.9, 0.999),
+                weight_decay=1e-4,
             )
-            self.optimizer_D = torch.optim.Adam(
+            self.optimizer_D = torch.optim.AdamW(
                 filter(
                     lambda p: p.requires_grad,
                     itertools.chain(
@@ -116,10 +159,12 @@ class CAJDMNetModel(BaseModel):
                 ),
                 lr=self.args.lr,
                 betas=(0.5, 0.999),
+                weight_decay=1e-4,
             )
 
             self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(self.device)
             self.criterion_recon = torch.nn.L1Loss().to(self.device)
+            self.criterion_class = LabelSmoothingCrossEntropy(smoothing=0.1).to(self.device)
 
     def set_input(self, data):
         self.img = data[0].to(self.device)
@@ -138,7 +183,7 @@ class CAJDMNetModel(BaseModel):
 
     def backward_G(self, epoch):
         # supervised
-        self.loss_class = F.cross_entropy(input=self.z1_enc, target=self.exp_lbl, reduction="mean")
+        self.loss_class = self.criterion_class(self.z1_enc, self.exp_lbl)
 
         lmk_tgt = self.landmarks.view(self.batch_size, -1)
         self.loss_lmk = self.criterion_lmk(self.lmk_pred, lmk_tgt)
