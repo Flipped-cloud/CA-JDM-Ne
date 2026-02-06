@@ -104,7 +104,8 @@ def validate_model(model, test_loader, args):
     total = 0
     
     with torch.inference_mode():
-        for data_val in tqdm(test_loader):
+        # 显示验证进度条
+        for data_val in tqdm(test_loader, desc="Validating", leave=False):
             if args.channels_last:
                 img = data_val[0].to(model.device if hasattr(model, 'device') else device, non_blocking=True).to(memory_format=torch.channels_last)
             else:
@@ -141,18 +142,28 @@ def validate_model(model, test_loader, args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", default=32, type=int)
+    
+    parser.add_argument("--batch_size", default=64, type=int) 
     parser.add_argument("--img_size", default=112, type=int)
     parser.add_argument("--num_epoch", default=100, type=int)
-    parser.add_argument("--log_step", default=50, type=int)
-    parser.add_argument("--val_step", default=200, type=int)
+    
+    # ------------------ 修改：调整日志和验证频率 ------------------
+    parser.add_argument("--log_step", default=100, type=int) # 每100步打印一次日志
+    parser.add_argument("--val_step", default=2000, type=int) # 每2000步验证一次 (之前是50，太快了)
+    # -----------------------------------------------------------
+    
     parser.add_argument("--save_step", default=500, type=int)
-    parser.add_argument("--early_stop_patience", default=20, type=int) # Increase patience from 10 to 20
+    # ------------------ 修改：早停改为5个epoch ------------------
+    parser.add_argument("--early_stop_patience", default=5, type=int) # 连续5个epoch不提升则停止
+    # -----------------------------------------------------------
     parser.add_argument("--isTrain", default=True, type=bool)
     parser.add_argument("--fc_layer", default=512, type=int)
     parser.add_argument("--noise_dim", default=100, type=int)
 
-    parser.add_argument("--num_classes", default=7, type=int)
+    # ------------------ AffectNet 设置 ------------------
+    parser.add_argument("--num_classes", default=8, type=int, help="8 for AffectNet, 7 for RAF-DB") 
+    # ---------------------------------------------------
+
     parser.add_argument("--num_landmarks", default=68, type=int)
     parser.add_argument("--noise_ratio", default=0, type=float)
     parser.add_argument("--gan_start_epoch", default=10, type=int)
@@ -181,24 +192,30 @@ def parse_args():
     parser.add_argument("--wing_w", default=0.5, type=float)
     parser.add_argument("--wing_epsilon", default=0.1, type=float)
 
-    parser.add_argument("--save_dir", default="runs_ca_jdm", type=str)
-    parser.add_argument("--dataset", default="raf", type=str, choices=["raf", "affectnet"])
+    # ------------------ 默认保存路径 ------------------
+    parser.add_argument("--save_dir", default="runs_affectnet", type=str)
+    # ------------------------------------------------
+
+    # ------------------ 默认为 affectnet ------------------
+    parser.add_argument("--dataset", default="affectnet", type=str, choices=["raf", "affectnet"])
+    # ----------------------------------------------------
+
     parser.add_argument("--seed", default=1688, type=int)
 
     # Model selection
     parser.add_argument("--model_type", default="ca_jdm", type=str, choices=["ca_jdm", "single_task", "multi_task"], 
-                       help="ca_jdm: CA-JDM-Net with GAN, single_task: FER only, multi_task: FER+FLD")
+                        help="ca_jdm: CA-JDM-Net with GAN, single_task: FER only, multi_task: FER+FLD")
     parser.add_argument("--backbone", default="ir50", type=str, choices=["ir50", "vgg", "resnet18"], 
-                       help="Backbone architecture")
+                        help="Backbone architecture")
     parser.add_argument("--use_ca", action="store_true", help="Enable Coordinate Attention (CA) in IR50 encoder")
     # parser.add_argument("--use_pretrained", action="store_true", help="Use pretrained weights")
     parser.add_argument("--no_pretrained", action="store_true", help="Disable pretrained weights")
     parser.add_argument("--pretrained_path", default="./pretrained/ms1mv3_arcface_r50.pth", type=str,
-                       help="Path to pretrained weights")
+                        help="Path to pretrained weights")
     parser.add_argument("--resume_seed", default=1688, type=int,
-                       help="If set, load best model from runs directory of this seed and resume training from its weights")
+                        help="If set, load best model from runs directory of this seed and resume training from its weights")
     parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/1688", type=str,
-                       help="If set, load weights from this file (single file) or directory (will search for best files)")
+                        help="If set, load weights from this file (single file) or directory (will search for best files)")
     # parser.add_argument("--use_dual_stream", action="store_true", help="Use dual-stream attention (default: single-stream CBAM)")
     parser.add_argument("--no_dual_stream", action="store_true", help="Disable dual-stream attention")
 
@@ -210,13 +227,15 @@ def parse_args():
     )
     parser.add_argument("--raf_train_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/train.csv", type=str)
     parser.add_argument("--raf_val_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/test.csv", type=str)
-    # AffectNet settings
-    parser.add_argument("--affectnet_img_root", default="../datasets/affectnet", type=str)
-    parser.add_argument("--affectnet_train_csv", default="../datasets/affectnet/training.csv", type=str)
-    parser.add_argument("--affectnet_val_csv", default="../datasets/affectnet/validate.csv", type=str)
+    
+    # ------------------ AffectNet 路径设置 ------------------
+    parser.add_argument("--affectnet_img_root", default="./datasets/affectnet/Manually_Annotated_Images/Manually_Annotated_Images", type=str)
+    parser.add_argument("--affectnet_train_csv", default="./datasets/affectnet/training.csv", type=str)
+    parser.add_argument("--affectnet_val_csv", default="./datasets/affectnet/validation.csv", type=str)
+    # -------------------------------------------------------
 
     # performance (deterministic-friendly)
-    parser.add_argument("--num_workers", default=8, type=int)
+    parser.add_argument("--num_workers", default=8, type=int) 
     parser.add_argument("--prefetch_factor", default=4, type=int)
     parser.add_argument("--persistent_workers", action="store_true")
     parser.add_argument("--pin_memory", action="store_true")
@@ -250,14 +269,18 @@ def train(writer, logger, args):
         train_dataset = RAFDataset_Fusion(args, phase="train")
         test_dataset = RAFDataset_Fusion(args, phase="test")
     else:
+        # AffectNet 数据加载
         train_dataset = AffectNetDataset_Fusion(args, phase="train")
         test_dataset = AffectNetDataset_Fusion(args, phase="test")
+    
     g = torch.Generator()
     g.manual_seed(args.seed)
 
     # Calculate weights for sampling (Class Balancing)
     sampler = None
     shuffle = True
+    
+    # Class balancing logic - useful for AffectNet due to imbalance
     if args.dataset == "raf":
         try:
             targets = train_dataset.train_labels 
@@ -266,9 +289,32 @@ def train(writer, logger, args):
             sample_weights = class_weights[targets]
             sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
             shuffle = False
-            logger.info("Using WeightedRandomSampler for class balancing.")
+            logger.info("Using WeightedRandomSampler for class balancing (RAF).")
         except Exception as e:
-            logger.warning(f"Could not init WeightedRandomSampler: {e}")
+            logger.warning(f"Could not init WeightedRandomSampler for RAF: {e}")
+    elif args.dataset == "affectnet":
+        # 如果 AffectNetDataset 暴露了 labels，也可以开启采样
+        try:
+            # 尝试获取 labels
+            if hasattr(train_dataset, 'labels'):
+                targets = train_dataset.labels
+            elif hasattr(train_dataset, 'file_paths'): # 有些实现是 list of tuples
+                targets = [item[1] for item in train_dataset.data] 
+            else:
+                targets = None
+            
+            if targets is not None:
+                targets = np.array(targets, dtype=int)
+                class_counts = np.bincount(targets)
+                # 避免除以0
+                class_counts[class_counts==0] = 1
+                class_weights = 1. / class_counts
+                sample_weights = class_weights[targets]
+                sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+                shuffle = False
+                logger.info("Using WeightedRandomSampler for class balancing (AffectNet).")
+        except Exception as e:
+            logger.warning(f"Could not init WeightedRandomSampler for AffectNet: {e}")
 
     train_loader = data.DataLoader(
         dataset=train_dataset,
@@ -312,7 +358,6 @@ def train(writer, logger, args):
         raise ValueError(f"Unknown model_type: {args.model_type}")
         
     # Load pretrained weights if specified
-    # Resume-from checkpoint (from another run's best) or load pretrained weights
     def _try_load_state_dict(module, path, desc):
         try:
             sd = torch.load(path, map_location="cpu")
@@ -330,7 +375,6 @@ def train(writer, logger, args):
     if args.resume_path:
         resume_path = args.resume_path
         if os.path.isfile(resume_path):
-            # try to load as whole-model first
             if hasattr(model, 'load_state_dict'):
                 try:
                     sd = torch.load(resume_path, map_location="cpu")
@@ -339,7 +383,6 @@ def train(writer, logger, args):
                         logger.info(f"Loaded full model state from {resume_path}")
                         resumed = True
                     except Exception:
-                        # try nested fields
                         if isinstance(sd, dict) and 'state_dict' in sd:
                             model.load_state_dict(sd['state_dict'])
                             logger.info(f"Loaded model state['state_dict'] from {resume_path}")
@@ -361,7 +404,7 @@ def train(writer, logger, args):
         else:
             resume_dir = None
 
-    # If we have a resume directory, try common filenames and model-specific loader
+    # If we have a resume directory, try common filenames
     if not resumed and resume_dir:
         # Prefer model's own loader if available
         if hasattr(model, 'load_networks'):
@@ -386,7 +429,6 @@ def train(writer, logger, args):
                         resumed = True
                         break
 
-            # classifier
             cls_candidates = [
                 os.path.join(resume_dir, 'best_classifier.pth'),
                 os.path.join(resume_dir, 'best_net_classifier.pth'),
@@ -395,9 +437,22 @@ def train(writer, logger, args):
                 if os.path.isfile(p) and hasattr(model, 'classifier'):
                     _try_load_state_dict(model.classifier, p, 'classifier')
 
-    # Finally, if not resumed and user requested pretrained backbone, load pretrained weights
-    if not resumed and args.use_pretrained and hasattr(model, 'encoder') and hasattr(model.encoder, 'load_pretrained_weights'):
-        model.encoder.load_pretrained_weights(args.pretrained_path)
+    # ------------------ 权重加载逻辑 ------------------
+    # 只要不 resume 且开启了 use_pretrained，就会尝试加载
+    if not resumed and args.use_pretrained:
+        # 即使不加 check，这里也会尝试加载，如果文件不存在会报错
+        # 加上 check 只是为了打印更友好的信息
+        if os.path.exists(args.pretrained_path):
+            if hasattr(model, 'encoder') and hasattr(model.encoder, 'load_pretrained_weights'):
+                model.encoder.load_pretrained_weights(args.pretrained_path)
+                logger.info(f"Loaded pretrained backbone weights from {args.pretrained_path}")
+                print(f"✅ Loaded pretrained backbone weights from {args.pretrained_path}")
+        else:
+            # 打印警告而不是崩溃，防止用户困惑
+            msg = f"⚠️ Warning: Pretrained path '{args.pretrained_path}' does not exist! Training from scratch (random init)."
+            logger.warning(msg)
+            print(msg)
+    # ------------------------------------------------
 
     # Init schedulers
     scheduler_G = None
@@ -417,7 +472,8 @@ def train(writer, logger, args):
     should_stop = False
 
     for epoch in range(args.num_epoch):
-        for step, data_batch in tqdm(enumerate(train_loader)):
+        # 增加 tqdm 描述，显示当前是在 Training
+        for step, data_batch in tqdm(enumerate(train_loader), desc=f"Training Epoch {epoch}", total=len(train_loader)):
             start_ts = time.time()
             total_steps += 1
 
@@ -456,9 +512,9 @@ def train(writer, logger, args):
 
             if total_steps % args.val_step == 0:
                 acc = validate_model(model, test_loader, args)
-                logger.info(f"acc: {acc:.2f}")
+                logger.info(f"val_acc: {acc:.2f}")  # Changed from "acc" to "val_acc" for clarity
                 writer.add_scalar("val/acc", acc, total_steps)
-                print("acc:", acc)
+                print("val_acc:", acc)  # Changed from "acc" to "val_acc" for clarity
 
                 if acc > best_acc:
                     best_acc = acc
@@ -493,13 +549,31 @@ def train(writer, logger, args):
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Auto-adjust num_classes if mismatch with dataset
+    if args.dataset == "affectnet" and args.num_classes == 7:
+        print("[Warning] Dataset is AffectNet but num_classes was 7. Auto-setting to 8.")
+        args.num_classes = 8
+    if args.dataset == "raf" and args.num_classes == 8:
+        print("[Warning] Dataset is RAF-DB but num_classes was 8. Auto-setting to 7.")
+        args.num_classes = 7
+        
     seed_everything(args.seed)
     run_id = args.seed
-    logdir = os.path.join(args.save_dir, str(run_id))
+    logdir = os.path.join(args.save_dir, f"{args.dataset}_{str(run_id)}") 
     writer = SummaryWriter(log_dir=logdir)
 
     logger = get_logger(logdir)
     logger.info("CA-JDM-Net training")
     save_config(logdir, args)
+    
+    # 打印配置信息，方便用户确认
+    print("\n" + "="*50)
+    print(f"🚀 Training Config Summary:")
+    print(f"   Dataset         : {args.dataset} (Classes: {args.num_classes})")
+    print(f"   Pretrained Path : {args.pretrained_path}")
+    print(f"   Image Root      : {args.affectnet_img_root if args.dataset == 'affectnet' else args.data_path}")
+    print(f"   Save Dir        : {logdir}")
+    print("="*50 + "\n")
 
     train(writer, logger, args)
