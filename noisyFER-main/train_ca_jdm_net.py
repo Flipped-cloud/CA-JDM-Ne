@@ -161,7 +161,7 @@ def parse_args():
     parser.add_argument("--num_classes", default=7, type=int)
     parser.add_argument("--num_landmarks", default=68, type=int)
     parser.add_argument("--noise_ratio", default=0, type=float)
-    parser.add_argument("--gan_start_epoch", default=10, type=int)#调参1 
+    parser.add_argument("--gan_start_epoch", default=10, type=int)
 
     parser.add_argument("--lambda_exp", default=1.0, type=float)
     parser.add_argument("--lambda_lmk", default=0.5, type=float)
@@ -189,7 +189,7 @@ def parse_args():
 
     parser.add_argument("--save_dir", default="runs_ca_jdm", type=str)
     parser.add_argument("--dataset", default="raf", type=str, choices=["raf", "affectnet"])
-    parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument("--seed", default=1688, type=int)
 
     # Model selection
     parser.add_argument("--model_type", default="ca_jdm", type=str, choices=["ca_jdm", "single_task", "multi_task"], 
@@ -205,28 +205,28 @@ def parse_args():
                        help="Path to IR50 pretrained weights for dual_stream")
     parser.add_argument("--fld_pretrained_path", default="checkpoints/mobilefacenet_model_best.pth", type=str,
                        help="Path to MobileFaceNet pretrained weights for dual_stream")
-    parser.add_argument("--resume_seed", default=42, type=int,
+    parser.add_argument("--resume_seed", default=1688, type=int,
                        help="If set, load best model from runs directory of this seed and resume training from its weights")
-    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/42", type=str,
+    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/1688", type=str,
                        help="If set, load weights from this file (single file) or directory (will search for best files)")
     # parser.add_argument("--use_dual_stream", action="store_true", help="Use dual-stream attention (default: single-stream CBAM)")
     parser.add_argument("--no_dual_stream", action="store_true", help="Disable dual-stream attention")
 
     # RAF settings
-    parser.add_argument(
-        "--data_path",
-        default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/Image/aligned",
-        type=str,
-    )
-    parser.add_argument("--raf_train_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/train.csv", type=str)
-    parser.add_argument("--raf_val_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/test.csv", type=str)
     # parser.add_argument(
     #     "--data_path",
-    #     default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\Image\\aligned",
+    #     default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/Image/aligned",
     #     type=str,
     # )
-    # parser.add_argument("--raf_train_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\train.csv", type=str)
-    # parser.add_argument("--raf_val_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\test.csv", type=str)
+    # parser.add_argument("--raf_train_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/train.csv", type=str)
+    # parser.add_argument("--raf_val_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/test.csv", type=str)
+    parser.add_argument(
+        "--data_path",
+        default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\Image\\aligned",
+        type=str,
+    )
+    parser.add_argument("--raf_train_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\train.csv", type=str)
+    parser.add_argument("--raf_val_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\test.csv", type=str)
     # AffectNet settings
     parser.add_argument("--affectnet_img_root", default="../datasets/affectnet", type=str)
     parser.add_argument("--affectnet_train_csv", default="../datasets/affectnet/training.csv", type=str)
