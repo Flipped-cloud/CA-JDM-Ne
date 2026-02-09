@@ -7,6 +7,7 @@ sys.path.append(root_path)  # 把根目录加入搜索路径
 
 import torch
 import time
+import numpy as np
 from tqdm import tqdm
 import argparse
 from loader.dataloader_raf_multi_task import DataloaderRAF_MultiTask
@@ -29,6 +30,8 @@ parser.add_argument("--val_step", default=100, type=int)
 parser.add_argument("--save_step", default=200, type=int)
 parser.add_argument("--num_epoch", default=100000, type=int)
 parser.add_argument("--isTrain", default=True, type=bool)
+parser.add_argument("--early_stop_patience", default=7, type=int)
+parser.add_argument("--seed", default=42, type=int)
 parser.add_argument("--fc_layer", default=500, type=int)
 parser.add_argument("--noise_dim", default=100, type=int, help='dimension of noise vector')
 
@@ -66,7 +69,25 @@ args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 def train(writer, logger):
+    g = torch.Generator()
+    g.manual_seed(args.seed)
     if args.base_dataset == 'raf':
         img_root = os.path.join(args.root, 'Image/myaligned/imgs')
         # noisy training lbl: predicted lbl on RAF by pretrained affectnet model, label in raf style:
@@ -80,12 +101,12 @@ def train(writer, logger):
         train_dataset.load_data_exp(train_exp_csv_file, img_root)
         train_dataset.load_data_va(train_va_csv_file)
         train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                       num_workers=8)
+                                                       num_workers=8, worker_init_fn=seed_worker, generator=g)
 
         val_dataset = DataloaderRAF(img_size=args.img_size, is_transform=False, split='test')
         val_dataset.load_data(val_csv_file, img_root)
         val_dataloader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=args.batch_size,
-                                                     shuffle=False, num_workers=4)
+                                                     shuffle=False, num_workers=4, worker_init_fn=seed_worker, generator=g)
 
     elif args.base_dataset == 'affectnet':
         img_root = os.path.join(args.root, 'myaligned')
@@ -99,11 +120,11 @@ def train(writer, logger):
         train_dataset = DataloaderAffectnet_MultiTask(img_size=args.img_size, exp_classes=7, is_transform=True)
         train_dataset.load_data(train_exp_csv_file, train_va_csv_file, img_root)
         train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=False,
-                                                       num_workers=8)
+                                                       num_workers=8, worker_init_fn=seed_worker, generator=g)
         val_dataset = DataloaderAffectnet_MultiTask(img_size=args.img_size, exp_classes=7, is_transform=False)
         val_dataset.load_data(test_csv_file, test_csv_file, img_root)
         val_dataloader = torch.utils.data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
-                                                     num_workers=2)
+                                                     num_workers=2, worker_init_fn=seed_worker, generator=g)
 
     model = MultiTaskModel(args)
     if args.vgg_pretrain:
@@ -113,6 +134,9 @@ def train(writer, logger):
     time_meter = averageMeter()
 
     total_steps = 0
+    best_acc = -1.0
+    best_epoch = -1
+    should_stop = False
     for epoch in range(args.num_epoch):
         for step, data in tqdm(enumerate(train_dataloader)):
             start_ts = time.time()
@@ -177,18 +201,35 @@ def train(writer, logger):
                     writer.add_scalar('val/acc', acc, total_steps)
                     print('acc:', acc)
 
+                if acc > best_acc:
+                    best_acc = acc
+                    best_epoch = epoch
+                    model.save_networks('best', writer.file_writer.get_logdir())
+                    logger.info(f"[*] best models saved. acc: {best_acc:.2f} @ epoch {best_epoch}")
+                elif best_epoch >= 0 and (epoch - best_epoch) >= args.early_stop_patience:
+                    logger.info(
+                        f"Early stopping: acc not improved for {args.early_stop_patience} epochs."
+                    )
+                    should_stop = True
+
                 if total_steps % args.save_step == 0:
                     save_suffix = 'last'
                     model.save_networks(save_suffix, writer.file_writer.get_logdir())
                     print("[*] models saved.")
                     logger.info("[*] models saved.")
 
+                if should_stop:
+                    break
 
+
+        if should_stop:
+            break
         if epoch == args.num_epoch:
             break
 
 
 if __name__ == '__main__':
+    seed_everything(args.seed)
     run_id = random.randint(1, 100000)
     logdir = os.path.join(args.save_dir, str(run_id))  # create new path
     writer = SummaryWriter(log_dir=logdir)

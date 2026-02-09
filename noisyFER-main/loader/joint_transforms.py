@@ -92,14 +92,15 @@ class RandomHorizontalFlip(object):
             
             # 2. 关键点坐标数学翻转
             landmarks = landmarks.clone()
-            landmarks[0::2] = w - landmarks[0::2]
+            # 建议用 (w - 1) - x，更符合像素坐标系（可选但推荐）
+            landmarks[0::2] = (w - 1) - landmarks[0::2]
             
             # 3. 关键点语义索引交换 (Semantic Index Swapping)
             # 这一步对于 68 点至关重要！
             # 将 Tensor 转为 Reshape 后的列表方便操作 [68, 2]
             lmk_reshaped = landmarks.view(-1, 2)
             new_lmk = lmk_reshaped.clone()
-            
+
             for i in range(68):
                 if i in self.flip_map:
                     # 如果该点有对称点，取对称点的坐标
@@ -111,6 +112,24 @@ class RandomHorizontalFlip(object):
             
             return image, new_lmk.view(-1)
             
+        return image, landmarks
+
+class ColorJitter(object):
+    """
+    颜色抖动（仅影响图像，不影响关键点）。
+    """
+    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1):
+        from torchvision import transforms
+        self.color_jitter = transforms.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue
+        )
+
+    def __call__(self, image, landmarks):
+        # ColorJitter 只作用于图像
+        image = self.color_jitter(image)
         return image, landmarks
 
 class ToTensor(object):
@@ -125,3 +144,61 @@ class Normalize(object):
 
     def __call__(self, image, landmarks):
         image = F.normalize(image, self.mean, self.std)
+        return image, landmarks  # <-- 关键：必须返回
+
+class RandomCrop(object):
+    """
+    随机裁剪图像和关键点。
+    注意：关键点需要同步进行坐标平移。
+    """
+    def __init__(self, size, padding=0):
+        if isinstance(size, int):
+            self.size = (size, size)
+        else:
+            self.size = size
+        self.padding = padding
+
+    def __call__(self, image, landmarks):
+        if self.padding > 0:
+            image = F.pad(image, self.padding)
+            # 关键点坐标也需要根据 padding 调整
+            landmarks = landmarks.clone()
+            landmarks[0::2] += self.padding  # x
+            landmarks[1::2] += self.padding  # y
+        
+        w, h = image.size
+        th, tw = self.size
+        
+        if w == tw and h == th:
+            return image, landmarks
+        
+        # 随机选择裁剪起点
+        i = random.randint(0, h - th)
+        j = random.randint(0, w - tw)
+        
+        # 裁剪图像
+        image = F.crop(image, i, j, th, tw)
+        
+        # 调整关键点坐标
+        landmarks = landmarks.clone()
+        landmarks[0::2] -= j  # x offset
+        landmarks[1::2] -= i  # y offset
+        
+        # 裁剪后可能有关键点超出边界，可选择裁剪到边界内
+        landmarks[0::2] = torch.clamp(landmarks[0::2], 0, tw - 1)
+        landmarks[1::2] = torch.clamp(landmarks[1::2], 0, th - 1)
+        
+        return image, landmarks
+
+class RandomErasing(object):
+    """
+    Random Erasing for Tensor image. Landmarks are unchanged.
+    """
+    def __init__(self, p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0, inplace=False):
+        from torchvision import transforms
+        self.eraser = transforms.RandomErasing(p=p, scale=scale, ratio=ratio, value=value, inplace=inplace)
+
+    def __call__(self, image, landmarks):
+        if isinstance(image, torch.Tensor):
+            image = self.eraser(image)
+        return image, landmarks

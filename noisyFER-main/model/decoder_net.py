@@ -103,3 +103,54 @@ class Decoder_128(nn.Module):
         return out
 
 
+class Decoder_112(nn.Module):
+    def __init__(self, img_size=112, latent_dim=10, noise_dim=100):
+        super(Decoder_112, self).__init__()
+        in_channels = latent_dim + noise_dim
+        self.linear = snlinear(in_features=in_channels, out_features=512 * 7 * 7)
+        self.deconv1 = snconvTrans2d(in_channels=512, out_channels=256, kernel_size=4, stride=2, padding=1)  # 256, 14, 14
+        self.bn1 = nn.Sequential(nn.BatchNorm2d(256), nn.ReLU(True))
+        self.deconv2 = snconvTrans2d(in_channels=256, out_channels=128, kernel_size=4, stride=2, padding=1)  # 128, 28, 28
+        self.bn2 = nn.Sequential(nn.BatchNorm2d(128), nn.ReLU(True))
+        self.deconv3 = snconvTrans2d(in_channels=128, out_channels=64, kernel_size=4, stride=2, padding=1)   # 64, 56, 56
+        self.bn3 = nn.Sequential(nn.BatchNorm2d(64), nn.ReLU(True))
+        self.deconv4 = snconvTrans2d(in_channels=64, out_channels=3, kernel_size=4, stride=2, padding=1)     # 3, 112, 112
+        self.tanh = nn.Tanh()
+
+    def forward(self, z):
+        code = self.linear(z)  # [bs, 512*7*7]
+        code = code.view(code.size(0), 512, 7, 7)
+        out = self.bn1(self.deconv1(code))
+        out = self.bn2(self.deconv2(out))
+        out = self.bn3(self.deconv3(out))
+        out = self.tanh(self.deconv4(out))
+        return out
+
+
+class Decoder_224(nn.Module):
+    def __init__(self, img_size=224, latent_dim=10, noise_dim=100):
+        super(Decoder_224, self).__init__()
+        in_channels = latent_dim + noise_dim
+        self.linear = snlinear(in_features=in_channels, out_features=512 * 7 * 7)
+        self.deconv1 = snconvTrans2d(in_channels=512, out_channels=256, kernel_size=4, stride=2, padding=1)  # 256, 14, 14
+        self.bn1 = nn.Sequential(nn.BatchNorm2d(256), nn.ReLU(True))
+        self.deconv2 = snconvTrans2d(in_channels=256, out_channels=128, kernel_size=4, stride=2, padding=1)  # 128, 28, 28
+        self.bn2 = nn.Sequential(nn.BatchNorm2d(128), nn.ReLU(True))
+        self.deconv3 = snconvTrans2d(in_channels=128, out_channels=64, kernel_size=4, stride=2, padding=1)   # 64, 56, 56
+        self.bn3 = nn.Sequential(nn.BatchNorm2d(64), nn.ReLU(True))
+        self.deconv4 = snconvTrans2d(in_channels=64, out_channels=32, kernel_size=4, stride=2, padding=1)    # 32, 112, 112
+        self.bn4 = nn.Sequential(nn.BatchNorm2d(32), nn.ReLU(True))
+        self.deconv5 = snconvTrans2d(in_channels=32, out_channels=3, kernel_size=4, stride=2, padding=1)     # 3, 224, 224
+        self.tanh = nn.Tanh()
+
+    def forward(self, z):
+        code = self.linear(z)  # [bs, 512*7*7]
+        code = code.view(code.size(0), 512, 7, 7)
+        out = self.bn1(self.deconv1(code))
+        out = self.bn2(self.deconv2(out))
+        out = self.bn3(self.deconv3(out))
+        out = self.bn4(self.deconv4(out))
+        out = self.tanh(self.deconv5(out))
+        return out
+
+

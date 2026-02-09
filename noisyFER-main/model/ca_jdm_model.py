@@ -10,8 +10,8 @@ root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(root_path)
 
 from model.base_model import BaseModel
-from model.encoder_net import Encoder
-from model.decoder_net import Decoder_64, Decoder_128
+from model.encoder_net import Encoder, IR50_Encoder, Encoder_Net
+from model.decoder_net import Decoder_64, Decoder_112, Decoder_128, Decoder_224
 from model.discriminator import (
     Discriminator_x,
     Discriminator_lbl,
@@ -31,6 +31,21 @@ def hinge_d(real_scores, fake_scores):
     return loss_real + loss_fake
 
 
+class LabelSmoothingCrossEntropy(torch.nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+
+    def forward(self, x, target):
+        logprobs = F.log_softmax(x, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+
 def hinge_g(fake_scores):
     return -torch.mean(fake_scores)
 
@@ -40,33 +55,87 @@ class CAJDMNetModel(BaseModel):
 
     def __init__(self, args):
         super(CAJDMNetModel, self).initialize(args)
-        self.device = device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.n_classes = args.num_classes
         self.landmark_dim = args.num_landmarks * 2
         self.latent_dim = self.n_classes
 
-        self.encoder = Encoder(
-            img_size=self.args.img_size,
-            fc_layer=self.args.fc_layer,
-            latent_dim=self.latent_dim,
-            noise_dim=self.args.noise_dim,
-        ).to(device)
+        # Which backbone to use
+        self.backbone_type = getattr(args, 'backbone', 'vgg')
+
+        # Choose encoder based on backbone argument
+        if self.backbone_type == 'dual_stream':
+            # ============================================================
+            # Heterogeneous Dual-Stream Encoder (IR50 + MobileFaceNet)
+            # ============================================================
+            fer_path = getattr(args, 'fer_pretrained_path', 'checkpoints/ms1mv3_arcface_r50.pth')
+            fld_path = getattr(args, 'fld_pretrained_path', 'checkpoints/mobilefacenet_model_best.pth')
+
+            self.encoder = Encoder_Net(
+                img_size=self.args.img_size,
+                fer_embedding_dim=self.args.fc_layer,  # 512
+                fld_embedding_size=self.landmark_dim,   # 136
+                use_se=getattr(self.args, 'use_se', False),
+            ).to(self.device)
+
+            # Load dual pretrained weights
+            self.encoder.load_pretrained_weights(
+                fer_path=fer_path,
+                fld_path=fld_path,
+            )
+
+            # Separate output heads on top of fer_embedding (512-d)
+            self.mean_layer = torch.nn.Linear(self.args.fc_layer, self.args.noise_dim).to(self.device)
+            self.logvar_layer = torch.nn.Linear(self.args.fc_layer, self.args.noise_dim).to(self.device)
+            self.c_layer = torch.nn.Linear(self.args.fc_layer, self.latent_dim).to(self.device)
+
+        elif self.backbone_type == 'ir50':
+            self.encoder = IR50_Encoder(
+                img_size=self.args.img_size,
+                fc_layer=self.args.fc_layer,
+                latent_dim=self.latent_dim,
+                noise_dim=self.args.noise_dim,
+                use_dual_stream=getattr(self.args, "use_dual_stream", True),
+                use_ca=getattr(self.args, "use_ca", False),
+            ).to(self.device)
+        else:
+            # Legacy VGG-style encoder
+            self.encoder = Encoder(
+                img_size=self.args.img_size,
+                fc_layer=self.args.fc_layer,
+                latent_dim=self.latent_dim,
+                noise_dim=self.args.noise_dim,
+                e_ratio=getattr(self.args, "e_ratio", 0.2),
+                scam_kernel=getattr(self.args, "scam_kernel", 7),
+            ).to(self.device)
 
         if self.args.img_size == 64:
             self.decoder = Decoder_64(
                 img_size=self.args.img_size,
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
-            ).to(device)
+            ).to(self.device)
+        elif self.args.img_size == 112:
+            self.decoder = Decoder_112(
+                img_size=self.args.img_size,
+                latent_dim=self.latent_dim + self.landmark_dim,
+                noise_dim=self.args.noise_dim,
+            ).to(self.device)
         elif self.args.img_size == 128:
             self.decoder = Decoder_128(
                 img_size=self.args.img_size,
                 latent_dim=self.latent_dim + self.landmark_dim,
                 noise_dim=self.args.noise_dim,
-            ).to(device)
+            ).to(self.device)
+        elif self.args.img_size == 224:
+            self.decoder = Decoder_224(
+                img_size=self.args.img_size,
+                latent_dim=self.latent_dim + self.landmark_dim,
+                noise_dim=self.args.noise_dim,
+            ).to(self.device)
         else:
-            raise ValueError("Only img_size 64 or 128 supported for CA-JDM-Net decoder.")
+            raise ValueError("Only img_size 64/112/128/224 supported for CA-JDM-Net decoder.")
 
         if self.args.isTrain:
             self.train_model_name = [
@@ -82,26 +151,41 @@ class CAJDMNetModel(BaseModel):
             # x / z0 / z1(emo) / lm / joint
             self.discriminator_x = Discriminator_x(
                 img_size=self.args.img_size, out_channels=512, wide=True, with_sx=True, early_xfeat=False
-            ).to(device)
+            ).to(self.device)
             self.discriminator_z0 = Discriminator_z0(
                 in_channels=self.args.noise_dim, out_channels=512
-            ).to(device)
+            ).to(self.device)
             self.discriminator_emo = Discriminator_lbl(
                 in_channels=self.n_classes, out_channels=512, use_embedding=True
-            ).to(device)
+            ).to(self.device)
             self.discriminator_lmk = Discriminator_lmk(
                 in_channels=self.landmark_dim, out_channels=512
-            ).to(device)
+            ).to(self.device)
             self.discriminator_joint_xz = Discriminator_joint(
                 in_channels=512 * 3
-            ).to(device)
+            ).to(self.device)
 
-            self.optimizer_G = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, itertools.chain(self.encoder.parameters(), self.decoder.parameters())),
+            # Build G parameter groups
+            g_param_groups = [
+                {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": self.args.lr * 0.1},
+                {"params": [p for n, p in self.decoder.named_parameters() if p.requires_grad], "lr": self.args.lr},
+            ]
+            # dual_stream has separate output heads
+            if self.backbone_type == 'dual_stream':
+                g_param_groups.append(
+                    {"params": list(self.mean_layer.parameters()) +
+                               list(self.logvar_layer.parameters()) +
+                               list(self.c_layer.parameters()),
+                     "lr": self.args.lr}
+                )
+
+            self.optimizer_G = torch.optim.AdamW(
+                g_param_groups,
                 lr=self.args.lr,
-                betas=(0.5, 0.999),
+                betas=(0.9, 0.999),
+                weight_decay=1e-4,
             )
-            self.optimizer_D = torch.optim.Adam(
+            self.optimizer_D = torch.optim.AdamW(
                 filter(
                     lambda p: p.requires_grad,
                     itertools.chain(
@@ -114,31 +198,49 @@ class CAJDMNetModel(BaseModel):
                 ),
                 lr=self.args.lr,
                 betas=(0.5, 0.999),
+                weight_decay=1e-4,
             )
 
-            self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(device)
-            self.criterion_recon = torch.nn.L1Loss().to(device)
+            self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(self.device)
+            self.criterion_recon = torch.nn.L1Loss().to(self.device)
+            self.criterion_class = LabelSmoothingCrossEntropy(smoothing=0.1).to(self.device)
 
     def set_input(self, data):
-        self.img = data[0].to(device)
-        self.exp_lbl = data[1].to(device)
-        self.landmarks = data[2].to(device)
+        self.img = data[0].to(self.device)
+        self.exp_lbl = data[1].to(self.device)
+        self.landmarks = data[2].to(self.device)
 
         self.batch_size = self.img.shape[0]
-
-        # make onehot for "real" emotion distribution
-        self.exp_lbl_onehot = torch.zeros(self.batch_size, self.n_classes, device=device)
+        self.exp_lbl_onehot = torch.zeros(self.batch_size, self.n_classes, device=self.device)
         self.exp_lbl_onehot.scatter_(1, self.exp_lbl.view(-1, 1), 1.0)
 
+    def _sample_z(self, z_mu, z_logvar):
+        """Reparameterization trick for VAE."""
+        z_std = torch.exp(0.5 * z_logvar)
+        eps = torch.randn_like(z_std)
+        return z_mu + z_std * eps
+
     def forward_G(self, epoch):
-        self.mean, self.logvar, self.z0_enc, self.z1_enc, self.lmk_enc = self.encoder(self.img)
+        if self.backbone_type == 'dual_stream':
+            # Dual-stream encoder returns (fer_embedding, fld_output)
+            fer_embed, fld_pred = self.encoder(self.img)
+            # fer_embed: (B, 512);  fld_pred: (B, 136)
+            self.mean = self.mean_layer(fer_embed)
+            self.logvar = self.logvar_layer(fer_embed)
+            self.z0_enc = self._sample_z(self.mean, self.logvar)
+            self.z1_enc = self.c_layer(fer_embed)  # emotion logits
+            self.lmk_pred = fld_pred
+        else:
+            # IR50_Encoder / legacy Encoder: returns 5 values
+            self.mean, self.logvar, self.z0_enc, self.z1_enc, self.lmk_enc = self.encoder(self.img)
+            self.lmk_pred = self.lmk_enc                         # (B,136)
+
         self.emo_prob = F.softmax(self.z1_enc, dim=1)        # (B,C)
-        self.lmk_pred = self.lmk_enc                         # (B,136)
         self.dec_img = self.decoder(torch.cat([self.z0_enc, self.emo_prob, self.lmk_pred], dim=1))
 
     def backward_G(self, epoch):
         # supervised
-        self.loss_class = F.cross_entropy(input=self.z1_enc, target=self.exp_lbl, reduction="mean")
+        self.loss_class = self.criterion_class(self.z1_enc, self.exp_lbl)
 
         lmk_tgt = self.landmarks.view(self.batch_size, -1)
         self.loss_lmk = self.criterion_lmk(self.lmk_pred, lmk_tgt)
@@ -150,7 +252,7 @@ class CAJDMNetModel(BaseModel):
         self.loss_recon = self.criterion_recon(self.dec_img, self.img)
 
         # adversarial (only after gan_start_epoch)
-        self.loss_gan = torch.tensor(0.0, device=device)
+        self.loss_gan = torch.tensor(0.0, device=self.device)
 
         if epoch >= self.args.gan_start_epoch:
             # ---- marginal x: real img vs fake reconstructed img ----

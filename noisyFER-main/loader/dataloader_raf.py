@@ -7,6 +7,8 @@ from PIL import Image
 from torch.utils import data
 from torchvision import transforms as T
 
+from . import joint_transforms as JT
+
 # from utils_fusion import joint_transforms
 # ...existing code...
 
@@ -14,55 +16,108 @@ class RAFDataset_Fusion(data.Dataset):
     def __init__(self, args, phase, transform=None):
         self.phase = phase
         self.args = args
-        self.data_root = args.data_path  # 包含 train.csv/test.csv 和 Image 文件夹的根目录
+        # NOTE:
+        # - args.data_path: image root (e.g. ...\Dataset\RAF-DB\Image\aligned)
+        # - args.raf_train_csv / args.raf_val_csv: explicit CSV paths
+        self.image_root = args.data_path
 
         # -----------------------------------------------------------
-        # 1. 定义图像变换：与 decoder 的 tanh 输出域对齐到 [-1, 1]
+        # 1. 定义联合变换（图像与关键点同步 Resize / Flip）
+        #    说明：RAF 的 train.csv/test.csv 中关键点是“原图像素坐标”。
+        #    - 先用 JointTransform 把关键点按原图尺寸 -> resize 后尺寸进行缩放/翻转
+        #    - 再把关键点归一化到 [0,1]（除以 args.img_size），与训练逻辑保持一致
         # -----------------------------------------------------------
-        if transform is not None:
-            self.transform = transform
-        else:
+        self.transform = transform
+        if self.transform is None:
             if phase == "train":
-                self.transform = T.Compose(
+                self.joint_transform = JT.Compose(
                     [
-                        T.Resize((args.img_size, args.img_size)),
-                        T.RandomHorizontalFlip(p=0.5),
-                        T.ToTensor(),  # [0,1]
-                        T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # -> [-1,1]
+                        JT.Resize((args.img_size, args.img_size)),
+                        JT.RandomHorizontalFlip(p=0.5),
+                        JT.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Add ColorJitter
+                        JT.ToTensor(),
+                        JT.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                        JT.RandomErasing(p=0.5),
                     ]
                 )
             else:
-                self.transform = T.Compose(
+                self.joint_transform = JT.Compose(
                     [
-                        T.Resize((args.img_size, args.img_size)),
-                        T.ToTensor(),
-                        T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                        JT.Resize((args.img_size, args.img_size)),
+                        JT.ToTensor(),
+                        JT.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
                     ]
                 )
+        else:
+            # 用户显式传入 transform 时：保持旧行为（只做图像变换，不做 landmark 同步增强）。
+            self.joint_transform = None
 
         # -----------------------------------------------------------
         # 2. 从 CSV 加载数据
         # -----------------------------------------------------------
-        csv_file = os.path.join(self.data_root, f"{phase}.csv")
-        if not os.path.exists(csv_file):
-            raise FileNotFoundError(f"CSV not found: {csv_file}")
+        if phase == "train":
+            csv_file = getattr(args, "raf_train_csv", None)
+        else:
+            csv_file = getattr(args, "raf_val_csv", None)
+
+        # Backward-compatible fallback: look for {phase}.csv next to image_root or its parent.
+        if not csv_file:
+            phase_csv = f"{phase}.csv"
+            candidates = [
+                os.path.join(self.image_root, phase_csv),
+                os.path.join(os.path.dirname(self.image_root), phase_csv),
+            ]
+            csv_file = next((p for p in candidates if os.path.exists(p)), None)
+
+        if not csv_file or not os.path.exists(csv_file):
+            raise FileNotFoundError(
+                f"CSV not found: {csv_file}. "
+                f"Set --raf_train_csv/--raf_val_csv explicitly. "
+                f"image_root={self.image_root} phase={phase}"
+            )
 
         print(f"Loading {phase} data from {csv_file}...")
         df = pd.read_csv(csv_file)
 
         # 2.1 解析图像路径
+        # CSV image column options: image_id | image | path | file | img | img_path
+        image_col = None
+        for cand in ("image_id", "image", "path", "file", "img", "img_path", "image_path"):
+            if cand in df.columns:
+                image_col = cand
+                break
+        if image_col is None:
+            # Fall back to first column if user-provided CSV has no header or unknown header
+            image_col = df.columns[0]
+
         self.file_paths = []
-        for img_id in df["image_id"]:
-            img_name = f"{img_id}.jpg" if not str(img_id).endswith(".jpg") else str(img_id)
-            img_path = os.path.join(self.data_root, "Image", "aligned", img_name)
-            if not os.path.exists(img_path):
-                # 兼容一些数据集把图片直接放 Image/ 下
-                alt_path = os.path.join(self.data_root, "Image", img_name)
-                img_path = alt_path if os.path.exists(alt_path) else img_path
+        for v in df[image_col].values:
+            s = str(v).strip()
+            # If it's a pure id (digits), default to .jpg
+            if s.isdigit():
+                s = f"{s}.jpg"
+            elif not os.path.splitext(s)[1]:
+                # no extension provided
+                s = f"{s}.jpg"
+
+            # If CSV already contains a relative path (relative to Image\\aligned), join with image_root.
+            # If it contains an absolute path, keep it.
+            img_path = s if os.path.isabs(s) else os.path.join(self.image_root, s)
             self.file_paths.append(img_path)
 
         # 2.2 解析标签（兼容 1-7 或 0-6）
-        raw_labels = df["label"].values.astype(np.int64)
+        label_col = "label" if "label" in df.columns else None
+        if label_col is None:
+            # If CSV has two columns without standard names, assume second column is label
+            if len(df.columns) >= 2:
+                label_col = df.columns[1]
+            else:
+                raise KeyError(
+                    f"Label column not found in CSV: {csv_file}. "
+                    f"Expected a 'label' column or at least 2 columns."
+                )
+
+        raw_labels = df[label_col].values.astype(np.int64)
         if raw_labels.max() == 7 and raw_labels.min() >= 1:
             clean_labels = raw_labels - 1
         else:
@@ -104,13 +159,19 @@ class RAFDataset_Fusion(data.Dataset):
     def __getitem__(self, index):
         img_path = self.file_paths[index]
         img = Image.open(img_path).convert("RGB")
-        img = self.transform(img)
 
         label = int(self.train_labels[index])
         label = torch.tensor(label, dtype=torch.long)
 
         landmarks = torch.from_numpy(self.landmarks_data[index]).float()
-        # 关键点坐标若是像素坐标，归一化到 [0,1]（与你现有训练逻辑一致）
+
+        if self.joint_transform is not None:
+            img, landmarks = self.joint_transform(img, landmarks)
+        else:
+            # 兼容旧接口：仅变换图像，不同步变换关键点。
+            img = self.transform(img)
+
+        # 关键点在 joint resize 之后处于“resize 后的像素坐标”，再归一化到 [0,1]
         landmarks = landmarks / float(self.args.img_size)
 
         return img, label, landmarks
