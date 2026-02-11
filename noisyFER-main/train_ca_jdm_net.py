@@ -20,6 +20,7 @@ from metrics import averageMeter
 from model.ca_jdm_model import CAJDMNetModel
 from model.multi_task_model import MultiTaskModel
 from model.encoder_net import IR50_Encoder
+from model.dual_stream_diagnostics import run_dual_stream_diagnostics
 import torch.nn as nn
 
 
@@ -244,6 +245,14 @@ def parse_args():
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--channels_last", action="store_true")
 
+    # Diagnostics (targeted for RAF + CA-JDM + dual_stream)
+    parser.add_argument("--enable_dual_stream_diag", action="store_true",
+                        help="Enable detailed diagnostics for dual_stream + ca_jdm + RAF config")
+    parser.add_argument("--diag_output", default="dual_stream_diagnostics", type=str,
+                        help="Directory to store diagnostics outputs")
+    parser.add_argument("--diag_max_batches", default=2, type=int,
+                        help="How many train batches to inspect for diagnostics")
+
     args = parser.parse_args()
     args.use_pretrained = not args.no_pretrained
     args.use_dual_stream = not args.no_dual_stream
@@ -332,6 +341,24 @@ def train(writer, logger, args):
         model.setup()
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}")
+
+    # Targeted diagnostics: RAF-DB + CA-JDM + dual_stream
+    should_run_diag = (
+        args.enable_dual_stream_diag
+        and args.dataset == "raf"
+        and args.model_type == "ca_jdm"
+        and getattr(model, "backbone_type", None) == "dual_stream"
+    )
+
+    if should_run_diag:
+        logger.info("Running dual-stream diagnostics (RAF + CA-JDM + dual_stream)...")
+        run_dual_stream_diagnostics(
+            model=model,
+            train_loader=train_loader,
+            args=args,
+            logger=logger,
+            output_dir=os.path.join(writer.file_writer.get_logdir(), args.diag_output),
+        )
         
     # Load pretrained weights if specified
     # Resume-from checkpoint (from another run's best) or load pretrained weights
