@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .attention import CCAM, SCAM, CBAM, SpatialAttention, ChannelAttention, CoordAtt, CoAttentionModule
+from .attention import CCAM, SCAM, CBAM, SpatialAttention, ChannelAttention, CoordAtt, CoAttentionModule, HeteroCoAttentionModule
 
 
 # ============================================================================
@@ -599,7 +599,7 @@ class Encoder_Net(nn.Module):
 
     - FER stream  : IR-50 backbone (ArcFace pretrained) for expression recognition.
     - FLD stream  : MobileFaceNet backbone for facial landmark detection.
-    - Interaction : CoAttentionModule at each stage — FLD features guide FER features.
+    - Interaction : HeteroCoAttentionModule at each stage (bidirectional, CCAM+SCAM).
 
     IR-50 Stage layout [3, 4, 14, 3] with channels [64, 128, 256, 512].
     MobileFaceNet multi-scale features with channels [64, 64, 128, 128].
@@ -609,7 +609,7 @@ class Encoder_Net(nn.Module):
         fld_output    : (B, 136) — 68 landmarks x 2.
     """
     def __init__(self, img_size=112, fer_embedding_dim=512, fld_embedding_size=136,
-                 use_se=False):
+                 use_se=False, e_ratio=0.2, scam_kernel=7):
         super(Encoder_Net, self).__init__()
         self.img_size = img_size
         self.fer_embedding_dim = fer_embedding_dim
@@ -662,10 +662,10 @@ class Encoder_Net(nn.Module):
         #   IR50 channels:          [64,  128, 256, 512]
         #   MobileFaceNet channels: [64,   64, 128, 128]
         # =================================================================
-        self.attn1 = CoAttentionModule(fld_channels=64,  fer_channels=64)
-        self.attn2 = CoAttentionModule(fld_channels=64,  fer_channels=128)
-        self.attn3 = CoAttentionModule(fld_channels=128, fer_channels=256)
-        self.attn4 = CoAttentionModule(fld_channels=128, fer_channels=512)
+        self.attn1 = HeteroCoAttentionModule(fer_channels=64,  fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel)
+        self.attn2 = HeteroCoAttentionModule(fer_channels=128, fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel)
+        self.attn3 = HeteroCoAttentionModule(fer_channels=256, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel)
+        self.attn4 = HeteroCoAttentionModule(fer_channels=512, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel)
 
         # =================================================================
         # FER Output Head: BN -> Dropout -> Flatten -> FC -> BN  (=> 512-d)
@@ -779,7 +779,7 @@ class Encoder_Net(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, x):
         """
-        Interleaved dual-stream forward.
+        Interleaved dual-stream forward (bidirectional).
 
         Args:
             x: (B, 3, 112, 112)
@@ -787,27 +787,40 @@ class Encoder_Net(nn.Module):
             fer_embedding: (B, 512)  — expression feature vector.
             fld_output:    (B, 136)  — landmark coordinates.
         """
-        # ---------- FLD stream (full forward to get multi-scale features) ----------
-        fld_feats, fld_output = self.fld_backbone(x)
-        # fld_feats: [feat0 (64,56,56), feat1 (64,28,28),
-        #             feat2 (128,14,14), feat3 (128,7,7)]
-
-        # ---------- FER stream with interleaved co-attention -------------------
+        # ---------- FER stem -------------------------------------------------
         fer_x = self.fer_input_layer(x)        # (B, 64, 112, 112)
 
-        fer_x = self.fer_layer1(fer_x)          # (B, 64,  56, 56)
-        fer_x = self.attn1(fer_x, fld_feats[0]) # co-attn point 1
+        # ---------- FLD stem -------------------------------------------------
+        fld_x = self.fld_backbone.conv1(x)     # (B, 64, 56, 56)
+        fld_x = self.fld_backbone.conv2_dw(fld_x)
 
-        fer_x = self.fer_layer2(fer_x)          # (B, 128, 28, 28)
-        fer_x = self.attn2(fer_x, fld_feats[1]) # co-attn point 2
+        # Stage 1
+        fer_x = self.fer_layer1(fer_x)         # (B, 64, 56, 56)
+        fer_x, fld_x = self.attn1(fer_x, fld_x)
 
-        fer_x = self.fer_layer3(fer_x)          # (B, 256, 14, 14)
-        fer_x = self.attn3(fer_x, fld_feats[2]) # co-attn point 3
+        # Stage 2
+        fld_x = self.fld_backbone.conv_23(fld_x)
+        fld_x = self.fld_backbone.conv_3(fld_x)  # (B, 64, 28, 28)
+        fer_x = self.fer_layer2(fer_x)           # (B, 128, 28, 28)
+        fer_x, fld_x = self.attn2(fer_x, fld_x)
 
-        fer_x = self.fer_layer4(fer_x)          # (B, 512,  7,  7)
-        fer_x = self.attn4(fer_x, fld_feats[3]) # co-attn point 4
+        # Stage 3
+        fld_x = self.fld_backbone.conv_34(fld_x)
+        fld_x = self.fld_backbone.conv_4(fld_x)  # (B, 128, 14, 14)
+        fer_x = self.fer_layer3(fer_x)           # (B, 256, 14, 14)
+        fer_x, fld_x = self.attn3(fer_x, fld_x)
 
-        # ---------- FER embedding head -----------------------------------------
+        # Stage 4
+        fld_x = self.fld_backbone.conv_45(fld_x)
+        fld_x = self.fld_backbone.conv_5(fld_x)  # (B, 128, 7, 7)
+        fer_x = self.fer_layer4(fer_x)           # (B, 512, 7, 7)
+        fer_x, fld_x = self.attn4(fer_x, fld_x)
+
+        # FLD embedding head
+        fld_x = self.fld_backbone.conv_6_sep(fld_x)
+        fld_output = self.fld_backbone.output_layer(fld_x)
+
+        # FER embedding head
         fer_embedding = self.fer_output_layer(fer_x)  # (B, 512)
 
         return fer_embedding, fld_output

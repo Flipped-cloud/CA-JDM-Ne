@@ -30,16 +30,23 @@ class RAFDataset_Fusion(data.Dataset):
         self.transform = transform
         if self.transform is None:
             if phase == "train":
-                self.joint_transform = JT.Compose(
+                transforms_list = [
+                    JT.Resize((args.img_size, args.img_size)),
+                    JT.RandomHorizontalFlip(p=0.5),
+                ]
+                if not getattr(args, "no_color_jitter", False):
+                    transforms_list.append(
+                        JT.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+                    )
+                transforms_list.extend(
                     [
-                        JT.Resize((args.img_size, args.img_size)),
-                        JT.RandomHorizontalFlip(p=0.5),
-                        JT.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1), # Add ColorJitter
                         JT.ToTensor(),
                         JT.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                        JT.RandomErasing(p=0.5),
                     ]
                 )
+                if not getattr(args, "no_random_erasing", False):
+                    transforms_list.append(JT.RandomErasing(p=0.5))
+                self.joint_transform = JT.Compose(transforms_list)
             else:
                 self.joint_transform = JT.Compose(
                     [
@@ -143,6 +150,13 @@ class RAFDataset_Fusion(data.Dataset):
         else:
             self.landmarks_data = np.zeros((len(self.file_paths), args.num_landmarks * 2), dtype=np.float32)
 
+        # Detect if landmarks are already normalized to [0,1]
+        if len(self.landmarks_data) > 0:
+            lmk_max = float(np.nanmax(self.landmarks_data))
+        else:
+            lmk_max = 0.0
+        self.landmarks_normalized = lmk_max <= 1.5
+
     def inject_noise(self, labels, noise_ratio, num_classes=7):
         labels = np.asarray(labels, dtype=np.int64).copy()
         n = len(labels)
@@ -166,6 +180,11 @@ class RAFDataset_Fusion(data.Dataset):
         landmarks = torch.from_numpy(self.landmarks_data[index]).float()
 
         if self.joint_transform is not None:
+            if self.landmarks_normalized:
+                w, h = img.size
+                landmarks = landmarks.clone()
+                landmarks[0::2] = landmarks[0::2] * float(w)
+                landmarks[1::2] = landmarks[1::2] * float(h)
             img, landmarks = self.joint_transform(img, landmarks)
         else:
             # 兼容旧接口：仅变换图像，不同步变换关键点。

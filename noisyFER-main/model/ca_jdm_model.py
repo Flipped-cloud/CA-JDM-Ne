@@ -77,6 +77,8 @@ class CAJDMNetModel(BaseModel):
                 fer_embedding_dim=self.args.fc_layer,  # 512
                 fld_embedding_size=self.landmark_dim,   # 136
                 use_se=getattr(self.args, 'use_se', False),
+                e_ratio=getattr(self.args, "e_ratio", 0.2),
+                scam_kernel=getattr(self.args, "scam_kernel", 7),
             ).to(self.device)
 
             # Load dual pretrained weights
@@ -203,7 +205,8 @@ class CAJDMNetModel(BaseModel):
 
             self.criterion_lmk = WingLoss(w=self.args.wing_w, epsilon=self.args.wing_epsilon).to(self.device)
             self.criterion_recon = torch.nn.L1Loss().to(self.device)
-            self.criterion_class = LabelSmoothingCrossEntropy(smoothing=0.1).to(self.device)
+            smoothing = float(getattr(self.args, "label_smoothing", 0.0))
+            self.criterion_class = LabelSmoothingCrossEntropy(smoothing=smoothing).to(self.device)
 
     def set_input(self, data):
         self.img = data[0].to(self.device)

@@ -42,17 +42,16 @@ class SingleTaskModel:
             use_ca=getattr(args, "use_ca", False),
         ).to(self.device)
         
-        # Classification head
-        self.classifier = nn.Linear(args.fc_layer, args.num_classes).to(self.device)
+        # Classification head (IR50 already outputs logits via z1)
+        self.classifier = nn.Identity()
         
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(
-            [
-                {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": args.lr * 0.1},
-                {"params": [p for n, p in self.classifier.named_parameters() if p.requires_grad], "lr": args.lr},
-            ],
-            lr=args.lr,
-        )
+        param_groups = [
+            {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": args.lr * 0.1},
+        ]
+        if any(p.requires_grad for p in self.classifier.parameters()):
+            param_groups.append({"params": [p for n, p in self.classifier.named_parameters() if p.requires_grad], "lr": args.lr})
+        self.optimizer = torch.optim.Adam(param_groups, lr=args.lr)
         
     def setup(self):
         """Setup for compatibility with CAJDMNetModel interface"""
@@ -149,7 +148,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", default=32, type=int)
     parser.add_argument("--img_size", default=112, type=int)
-    parser.add_argument("--num_epoch", default=100, type=int)
+    parser.add_argument("--num_epoch", default=150, type=int)
     parser.add_argument("--log_step", default=50, type=int)
     parser.add_argument("--val_step", default=200, type=int)
     parser.add_argument("--save_step", default=500, type=int)
@@ -161,7 +160,7 @@ def parse_args():
     parser.add_argument("--num_classes", default=7, type=int)
     parser.add_argument("--num_landmarks", default=68, type=int)
     parser.add_argument("--noise_ratio", default=0, type=float)
-    parser.add_argument("--gan_start_epoch", default=10, type=int)
+    parser.add_argument("--gan_start_epoch", default=10, type=int)#调参1 
 
     parser.add_argument("--lambda_exp", default=1.0, type=float)
     parser.add_argument("--lambda_lmk", default=0.5, type=float)
@@ -189,7 +188,13 @@ def parse_args():
 
     parser.add_argument("--save_dir", default="runs_ca_jdm", type=str)
     parser.add_argument("--dataset", default="raf", type=str, choices=["raf", "affectnet"])
-    parser.add_argument("--seed", default=1688, type=int)
+    parser.add_argument("--seed", default=7043, type=int)
+
+    # Regularization / augmentation
+    parser.add_argument("--label_smoothing", default=0.0, type=float)
+    parser.add_argument("--no_color_jitter", action="store_true")
+    parser.add_argument("--no_random_erasing", action="store_true")
+    parser.add_argument("--no_class_balance", action="store_true")
 
     # Model selection
     parser.add_argument("--model_type", default="ca_jdm", type=str, choices=["ca_jdm", "single_task", "multi_task"], 
@@ -205,28 +210,28 @@ def parse_args():
                        help="Path to IR50 pretrained weights for dual_stream")
     parser.add_argument("--fld_pretrained_path", default="checkpoints/mobilefacenet_model_best.pth", type=str,
                        help="Path to MobileFaceNet pretrained weights for dual_stream")
-    parser.add_argument("--resume_seed", default=1688, type=int,
+    parser.add_argument("--resume_seed", default=7043, type=int,
                        help="If set, load best model from runs directory of this seed and resume training from its weights")
-    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/1688", type=str,
+    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/7043", type=str,
                        help="If set, load weights from this file (single file) or directory (will search for best files)")
     # parser.add_argument("--use_dual_stream", action="store_true", help="Use dual-stream attention (default: single-stream CBAM)")
     parser.add_argument("--no_dual_stream", action="store_true", help="Disable dual-stream attention")
 
     # RAF settings
-    # parser.add_argument(
-    #     "--data_path",
-    #     default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/Image/aligned",
-    #     type=str,
-    # )
-    # parser.add_argument("--raf_train_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/train.csv", type=str)
-    # parser.add_argument("--raf_val_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/test.csv", type=str)
     parser.add_argument(
         "--data_path",
-        default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\Image\\aligned",
+        default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/Image/aligned",
         type=str,
     )
-    parser.add_argument("--raf_train_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\train.csv", type=str)
-    parser.add_argument("--raf_val_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\test.csv", type=str)
+    parser.add_argument("--raf_train_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/train.csv", type=str)
+    parser.add_argument("--raf_val_csv", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/Dataset/RAF-DB/test.csv", type=str)
+    # parser.add_argument(
+    #     "--data_path",
+    #     default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\Image\\aligned",
+    #     type=str,
+    # )
+    # parser.add_argument("--raf_train_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\train.csv", type=str)
+    # parser.add_argument("--raf_val_csv", default="D:\\Python-Program\\CA-JDM-Ne-main\\noisyFER-main\\Dataset\\RAF-DB\\test.csv", type=str)
     # AffectNet settings
     parser.add_argument("--affectnet_img_root", default="../datasets/affectnet", type=str)
     parser.add_argument("--affectnet_train_csv", default="../datasets/affectnet/training.csv", type=str)
@@ -275,7 +280,7 @@ def train(writer, logger, args):
     # Calculate weights for sampling (Class Balancing)
     sampler = None
     shuffle = True
-    if args.dataset == "raf":
+    if args.dataset == "raf" and not args.no_class_balance:
         try:
             targets = train_dataset.train_labels 
             class_counts = np.bincount(targets)

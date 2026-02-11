@@ -291,3 +291,66 @@ class CoAttentionModule(nn.Module):
         # 残差连接: output = f_fer * mask + f_fer
         output = f_fer * mask + f_fer
         return output
+
+
+class HeteroCoAttentionModule(nn.Module):
+    """
+    Heterogeneous co-attention block aligned with CMCNN-style CCAM + SCAM.
+
+    This block aligns FLD features to FER channels (if needed), then applies
+    CCAM (channel correlation) and SCAM (spatial co-attention). The two
+    attended FER features are blended with learnable weights and a residual.
+    """
+    def __init__(self, fer_channels: int, fld_channels: int, e_ratio: float = 0.2, scam_kernel: int = 7):
+        super().__init__()
+        self.fer_channels = fer_channels
+        self.fld_channels = fld_channels
+
+        if fer_channels != fld_channels:
+            self.fld_to_fer = nn.Sequential(
+                nn.Conv2d(fld_channels, fer_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(fer_channels),
+                nn.ReLU(inplace=True),
+            )
+            self.fer_to_fld = nn.Sequential(
+                nn.Conv2d(fer_channels, fld_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(fld_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.fld_to_fer = nn.Identity()
+            self.fer_to_fld = nn.Identity()
+
+        self.ccam = CCAM(fer_channels, e_ratio=e_ratio)
+        self.scam = SCAM(fer_channels, kernel_size=scam_kernel)
+
+        # CCAM/SCAM 内部融合权重
+        self.alpha_f = nn.Parameter(torch.FloatTensor([0.5, 0.5]))
+        self.alpha_l = nn.Parameter(torch.FloatTensor([0.5, 0.5]))
+
+        # CMCNN 风格 cross-stitch 2×2 融合矩阵
+        self.cs = nn.Parameter(torch.tensor([[1.0, 0.0],
+                                             [0.0, 1.0]], dtype=torch.float32))
+
+    def forward(self, f_fer: torch.Tensor, f_fld: torch.Tensor) -> torch.Tensor:
+        f_fld_aligned = self.fld_to_fer(f_fld)
+
+        f_ccam, l_ccam = self.ccam(f_fer, f_fld_aligned)
+        f_scam, l_scam = self.scam(f_fer, f_fld_aligned)
+
+        w_f = torch.softmax(self.alpha_f, dim=0)
+        w_l = torch.softmax(self.alpha_l, dim=0)
+
+        f_att = w_f[0] * f_ccam + w_f[1] * f_scam
+        l_att = w_l[0] * l_ccam + w_l[1] * l_scam
+
+        # cross-stitch 融合（双向）
+        f_mix = self.cs[0, 0] * f_att + self.cs[0, 1] * l_att
+        l_mix = self.cs[1, 0] * f_att + self.cs[1, 1] * l_att
+
+        # 残差 + 反向对齐
+        out_fer = f_mix + f_fer
+        out_fld_aligned = l_mix + f_fld_aligned
+        out_fld = self.fer_to_fld(out_fld_aligned)
+
+        return out_fer, out_fld
