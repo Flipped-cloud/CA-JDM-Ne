@@ -609,7 +609,7 @@ class Encoder_Net(nn.Module):
         fld_output    : (B, 136) — 68 landmarks x 2.
     """
     def __init__(self, img_size=112, fer_embedding_dim=512, fld_embedding_size=136,
-                 use_se=False, e_ratio=0.2, scam_kernel=7):
+                 use_se=False, e_ratio=0.2, scam_kernel=7, align_dim=None):
         super(Encoder_Net, self).__init__()
         self.img_size = img_size
         self.fer_embedding_dim = fer_embedding_dim
@@ -662,10 +662,68 @@ class Encoder_Net(nn.Module):
         #   IR50 channels:          [64,  128, 256, 512]
         #   MobileFaceNet channels: [64,   64, 128, 128]
         # =================================================================
-        self.attn1 = HeteroCoAttentionModule(fer_channels=64,  fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel)
-        self.attn2 = HeteroCoAttentionModule(fer_channels=128, fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel)
-        self.attn3 = HeteroCoAttentionModule(fer_channels=256, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel)
-        self.attn4 = HeteroCoAttentionModule(fer_channels=512, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel)
+        if img_size % 16 != 0:
+            raise ValueError(f"Unsupported img_size: {img_size}. Expected divisible by 16.")
+        s1 = img_size // 2
+        s2 = img_size // 4
+        s3 = img_size // 8
+        s4 = img_size // 16
+
+        self.attn1 = HeteroCoAttentionModule(fer_channels=64,  fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s1)
+        self.attn2 = HeteroCoAttentionModule(fer_channels=128, fld_channels=64,  e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s2)
+        self.attn3 = HeteroCoAttentionModule(fer_channels=256, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s3)
+        self.attn4 = HeteroCoAttentionModule(fer_channels=512, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s4)
+
+        # Optional alignment projections for cross-stream feature alignment loss
+        self.align_dim = align_dim
+        if align_dim is not None and align_dim > 0:
+            self.fer_align = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(256, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(512, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+            ])
+            self.fld_align = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(align_dim),
+                    nn.ReLU(inplace=True),
+                ),
+            ])
+        else:
+            self.fer_align = None
+            self.fld_align = None
 
         # =================================================================
         # FER Output Head: BN -> Dropout -> Flatten -> FC -> BN  (=> 512-d)
@@ -676,6 +734,16 @@ class Encoder_Net(nn.Module):
             final_spatial = 14
         else:
             raise ValueError(f"Unsupported img_size: {img_size}. Use 112 or 224.")
+
+        # [ARCH CHANGE] Feature Fusion Bottleneck
+        # Fuses FER (512) and FLD (512) features before classification
+        # to force gradient flow into the landmark backbone.
+        print("[Encoder_Net] Enabling Feature Fusion (FER+FLD -> Bottleneck -> Output)")
+        self.fusion_bottleneck = nn.Sequential(
+            nn.Conv2d(512 + 512, 512, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
 
         self.fer_output_layer = nn.Sequential(
             nn.BatchNorm2d(512),
@@ -777,7 +845,7 @@ class Encoder_Net(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    def forward(self, x):
+    def forward(self, x, return_feats=False):
         """
         Interleaved dual-stream forward (bidirectional).
 
@@ -794,35 +862,59 @@ class Encoder_Net(nn.Module):
         fld_x = self.fld_backbone.conv1(x)     # (B, 64, 56, 56)
         fld_x = self.fld_backbone.conv2_dw(fld_x)
 
+        align_feats = []
+
         # Stage 1
         fer_x = self.fer_layer1(fer_x)         # (B, 64, 56, 56)
         fer_x, fld_x = self.attn1(fer_x, fld_x)
+        if return_feats and self.fer_align is not None and self.fld_align is not None:
+            fer_vec = F.adaptive_avg_pool2d(self.fer_align[0](fer_x), 1).flatten(1)
+            fld_vec = F.adaptive_avg_pool2d(self.fld_align[0](fld_x), 1).flatten(1)
+            align_feats.append((fer_vec, fld_vec))
 
         # Stage 2
         fld_x = self.fld_backbone.conv_23(fld_x)
         fld_x = self.fld_backbone.conv_3(fld_x)  # (B, 64, 28, 28)
         fer_x = self.fer_layer2(fer_x)           # (B, 128, 28, 28)
         fer_x, fld_x = self.attn2(fer_x, fld_x)
+        if return_feats and self.fer_align is not None and self.fld_align is not None:
+            fer_vec = F.adaptive_avg_pool2d(self.fer_align[1](fer_x), 1).flatten(1)
+            fld_vec = F.adaptive_avg_pool2d(self.fld_align[1](fld_x), 1).flatten(1)
+            align_feats.append((fer_vec, fld_vec))
 
         # Stage 3
         fld_x = self.fld_backbone.conv_34(fld_x)
         fld_x = self.fld_backbone.conv_4(fld_x)  # (B, 128, 14, 14)
         fer_x = self.fer_layer3(fer_x)           # (B, 256, 14, 14)
         fer_x, fld_x = self.attn3(fer_x, fld_x)
+        if return_feats and self.fer_align is not None and self.fld_align is not None:
+            fer_vec = F.adaptive_avg_pool2d(self.fer_align[2](fer_x), 1).flatten(1)
+            fld_vec = F.adaptive_avg_pool2d(self.fld_align[2](fld_x), 1).flatten(1)
+            align_feats.append((fer_vec, fld_vec))
 
         # Stage 4
         fld_x = self.fld_backbone.conv_45(fld_x)
         fld_x = self.fld_backbone.conv_5(fld_x)  # (B, 128, 7, 7)
         fer_x = self.fer_layer4(fer_x)           # (B, 512, 7, 7)
         fer_x, fld_x = self.attn4(fer_x, fld_x)
+        if return_feats and self.fer_align is not None and self.fld_align is not None:
+            fer_vec = F.adaptive_avg_pool2d(self.fer_align[3](fer_x), 1).flatten(1)
+            fld_vec = F.adaptive_avg_pool2d(self.fld_align[3](fld_x), 1).flatten(1)
+            align_feats.append((fer_vec, fld_vec))
 
         # FLD embedding head
         fld_x = self.fld_backbone.conv_6_sep(fld_x)
         fld_output = self.fld_backbone.output_layer(fld_x)
 
-        # FER embedding head
-        fer_embedding = self.fer_output_layer(fer_x)  # (B, 512)
+        # FER embedding head (With Feature Fusion)
+        # Gradient Flow: Loss -> fer_embedding -> fer_output_layer -> fusion_bottleneck -> [fer_x, fld_x]
+        # This guarantees fld_x receives gradients from the emotion classification task.
+        combined = torch.cat([fer_x, fld_x], dim=1)
+        fused_x = self.fusion_bottleneck(combined)
+        fer_embedding = self.fer_output_layer(fused_x)  # (B, 512)
 
+        if return_feats:
+            return fer_embedding, fld_output, align_feats
         return fer_embedding, fld_output
 
 

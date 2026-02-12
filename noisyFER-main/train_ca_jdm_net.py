@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils import data
-from tensorboardX import SummaryWriter
+from tensorboardX import SummaryWriter  # type: ignore
 
 from loader.dataloader_raf import RAFDataset_Fusion
 from loader.dataloader_affectnet_lmk import AffectNetDataset_Fusion
@@ -20,6 +20,7 @@ from metrics import averageMeter
 from model.ca_jdm_model import CAJDMNetModel
 from model.multi_task_model import MultiTaskModel
 from model.encoder_net import IR50_Encoder
+from model.dual_stream_diagnostics import run_dual_stream_diagnostics, update_dual_stream_diag_report
 import torch.nn as nn
 
 
@@ -89,16 +90,16 @@ class SingleTaskModel:
 
 def validate_model(model, test_loader, args):
     """Unified validation function for all model types"""
-    # Set model to eval mode
     if hasattr(model, 'encoder'):
         encoder_was_training = model.encoder.training
         model.encoder.eval()
     else:
         encoder_was_training = None
-    
-    if hasattr(model, 'classifier'):
-        model.classifier.eval()
-    
+
+    # ensure head eval too
+    if hasattr(model, 'c_layer'):
+        model.c_layer.eval()
+
     correct = 0
     total = 0
     
@@ -115,7 +116,10 @@ def validate_model(model, test_loader, args):
                 if getattr(model, "backbone_type", None) == "dual_stream":
                     # dual_stream 下提取特征，然后手动经过分类头
                     fer_embed, _ = model.encoder(img)
-                    z1_enc = model.c_layer(fer_embed) 
+                    if getattr(model, "use_arcface", False):
+                        z1_enc = model.c_layer(fer_embed, None)
+                    else:
+                        z1_enc = model.c_layer(fer_embed)
                 else:
                     # 传统架构 encoder 直接输出 5 个值，取第 4 个
                     _, _, _, z1_enc, _ = model.encoder(img)
@@ -152,7 +156,7 @@ def parse_args():
     parser.add_argument("--log_step", default=50, type=int)
     parser.add_argument("--val_step", default=200, type=int)
     parser.add_argument("--save_step", default=500, type=int)
-    parser.add_argument("--early_stop_patience", default=20, type=int) # Increase patience from 10 to 20
+    parser.add_argument("--early_stop_patience", default=15, type=int) # Increase patience from 10 to 20
     parser.add_argument("--isTrain", default=True, type=bool)
     parser.add_argument("--fc_layer", default=512, type=int)
     parser.add_argument("--noise_dim", default=100, type=int)
@@ -160,13 +164,21 @@ def parse_args():
     parser.add_argument("--num_classes", default=7, type=int)
     parser.add_argument("--num_landmarks", default=68, type=int)
     parser.add_argument("--noise_ratio", default=0, type=float)
-    parser.add_argument("--gan_start_epoch", default=10, type=int)#调参1 
+    parser.add_argument("--gan_start_epoch", default=999, type=int)#调参1 
 
-    parser.add_argument("--lambda_exp", default=1.0, type=float)
-    parser.add_argument("--lambda_lmk", default=0.5, type=float)
+    parser.add_argument("--lambda_exp", default=0.1, type=float)  # Adjusted default to 0.5 (was 1.0)
+    parser.add_argument("--lambda_lmk", default=2.0, type=float)  # Adjusted default to 1.0 (was 0.5)
     parser.add_argument("--lambda_gan", default=0.5, type=float)
     parser.add_argument("--lambda_recon", default=1.0, type=float)
     parser.add_argument("--lambda_kl", default=0.001, type=float)
+    parser.add_argument("--lambda_align", default=0.0, type=float)
+    parser.add_argument("--align_dim", default=128, type=int)
+    
+    # New aggressiveness arguments
+    parser.add_argument("--lambda_fer", default=0.5, type=float, help="Use this instead of lambda_exp for clarity if desired")
+    parser.add_argument("--grad_clip", default=5.0, type=float, help="Max norm for gradient clipping")
+    parser.add_argument("--step_decay_epoch", default=10, type=int, help="Epoch to aggressively decay LR by 0.1")
+    parser.add_argument("--freeze_fld_epoch", default=15, type=int, help="Epoch to freeze FLD branch (Delayed to allow alignment)")
 
     parser.add_argument("--lambda_sx", default=1.0, type=float)
     parser.add_argument("--lambda_sz0", default=1.0, type=float)
@@ -178,9 +190,9 @@ def parse_args():
     parser.add_argument("--e_ratio", default=0.2, type=float)
     parser.add_argument("--scam_kernel", default=7, type=int, choices=[3, 7])
 
-    parser.add_argument("--lr", default=0.0001, type=float)
+    parser.add_argument("--lr", default=0.00005, type=float) # Reduced from 0.0001
     parser.add_argument("--iter_G", default=1, type=int)
-    parser.add_argument("--iter_D", default=2, type=int)
+    parser.add_argument("--iter_D", default=0, type=int)
 
     # Landmarks are normalized to [0,1] in RAF dataloader, so use small WingLoss params
     parser.add_argument("--wing_w", default=0.5, type=float)
@@ -188,10 +200,10 @@ def parse_args():
 
     parser.add_argument("--save_dir", default="runs_ca_jdm", type=str)
     parser.add_argument("--dataset", default="raf", type=str, choices=["raf", "affectnet"])
-    parser.add_argument("--seed", default=7043, type=int)
+    parser.add_argument("--seed", default=326, type=int)
 
     # Regularization / augmentation
-    parser.add_argument("--label_smoothing", default=0.0, type=float)
+    parser.add_argument("--label_smoothing", default=0.05, type=float)
     parser.add_argument("--no_color_jitter", action="store_true")
     parser.add_argument("--no_random_erasing", action="store_true")
     parser.add_argument("--no_class_balance", action="store_true")
@@ -210,9 +222,9 @@ def parse_args():
                        help="Path to IR50 pretrained weights for dual_stream")
     parser.add_argument("--fld_pretrained_path", default="checkpoints/mobilefacenet_model_best.pth", type=str,
                        help="Path to MobileFaceNet pretrained weights for dual_stream")
-    parser.add_argument("--resume_seed", default=7043, type=int,
+    parser.add_argument("--resume_seed", default=326, type=int,
                        help="If set, load best model from runs directory of this seed and resume training from its weights")
-    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/7043", type=str,
+    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/326", type=str,
                        help="If set, load weights from this file (single file) or directory (will search for best files)")
     # parser.add_argument("--use_dual_stream", action="store_true", help="Use dual-stream attention (default: single-stream CBAM)")
     parser.add_argument("--no_dual_stream", action="store_true", help="Disable dual-stream attention")
@@ -243,6 +255,30 @@ def parse_args():
     parser.add_argument("--persistent_workers", action="store_true")
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--channels_last", action="store_true")
+
+    # Diagnostics (targeted for RAF + CA-JDM + dual_stream)
+    parser.add_argument("--enable_dual_stream_diag", action="store_true",
+                        help="Enable detailed diagnostics for dual_stream + ca_jdm + RAF config")
+    parser.add_argument("--diag_output", default="dual_stream_diagnostics", type=str,
+                        help="Directory to store diagnostics outputs")
+    parser.add_argument("--diag_max_batches", default=5, type=int,
+                        help="How many train batches to inspect for diagnostics")
+    parser.add_argument("--diag_interval_steps", default=0, type=int,
+                        help="Update dual_stream_diag_report.json every N steps (0 disables)")
+    parser.add_argument("--diag_interval_epochs", default=0, type=int,
+                        help="Update dual_stream_diag_report.json every N epochs (0 disables)")
+
+    # ---- ArcFace (classification head) ----
+    parser.add_argument("--use_arcface", action="store_true", help="Use ArcFace margin head for FER classification (recommended)")
+    parser.add_argument("--arc_s", default=30.0, type=float)
+    parser.add_argument("--arc_m", default=0.5, type=float)
+
+    # ---- warmup to avoid recon/KL hurting early FER ----
+    parser.add_argument("--kl_start_epoch", default=10, type=int)
+    parser.add_argument("--recon_start_epoch", default=10, type=int)
+
+    # ---- FER backbone LR multiplier (dual_stream encoder) ----
+    parser.add_argument("--fer_lr_mult", default=0.2, type=float, help="FER backbone lr = lr * fer_lr_mult (dual_stream)")
 
     args = parser.parse_args()
     args.use_pretrained = not args.no_pretrained
@@ -332,7 +368,25 @@ def train(writer, logger, args):
         model.setup()
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}")
-        
+    
+    # Targeted diagnostics: RAF-DB + CA-JDM + dual_stream
+    should_run_diag = (
+        args.enable_dual_stream_diag
+        and args.dataset == "raf"
+        and args.model_type == "ca_jdm"
+        and getattr(model, "backbone_type", None) == "dual_stream"
+    )
+
+    if should_run_diag:
+        logger.info("Running dual-stream diagnostics (RAF + CA-JDM + dual_stream)...")
+        run_dual_stream_diagnostics(
+            model=model,
+            train_loader=train_loader,
+            args=args,
+            logger=logger,
+            output_dir=os.path.join(writer.file_writer.get_logdir(), args.diag_output),
+        )
+
     # Load pretrained weights if specified
     # Resume-from checkpoint (from another run's best) or load pretrained weights
     def _try_load_state_dict(module, path, desc):
@@ -461,6 +515,29 @@ def train(writer, logger, args):
             model.optimize_params(epoch)
             time_meter.update(time.time() - start_ts)
 
+            # --- Freeze FLD logic ---
+            if epoch == args.freeze_fld_epoch and step == 0 and epoch > 0:
+                if hasattr(model, 'encoder') and hasattr(model.encoder, 'fld_backbone'):
+                    logger.info("Freezing FLD branch (MobileFaceNet)...")
+                    for param in model.encoder.fld_backbone.parameters():
+                        param.requires_grad = False
+                    # Make sure optimizer knows? 
+                    # Actually, setting requires_grad=False is enough to stop gradients, 
+                    # but optimizer will still track them unless we remove them.
+                    # Usually fine to leave in optimizer as 0 grad, efficiency loss is minimal for small model.
+            # ------------------------
+
+            if should_run_diag and args.diag_interval_steps > 0 and total_steps % args.diag_interval_steps == 0:
+                update_dual_stream_diag_report(
+                    model=model,
+                    batch=data_batch,
+                    args=args,
+                    logger=logger,
+                    output_dir=os.path.join(writer.file_writer.get_logdir(), args.diag_output),
+                    step=total_steps,
+                    epoch=epoch,
+                )
+
             if total_steps % args.log_step == 0:
                 writer.add_scalar("train/loss_exp", model.loss_class.item(), total_steps)
                 writer.add_scalar("train/loss_lmk", model.loss_lmk.item(), total_steps)
@@ -507,9 +584,47 @@ def train(writer, logger, args):
             scheduler_G.step()
         if scheduler_D is not None:
             scheduler_D.step()
+
+        # --- Aggressive Decay logic ---
+        if epoch + 1 == args.step_decay_epoch:
+            logger.info("Aggressive LR Decay: multiplying all LRs by 0.1")
+            if hasattr(model, 'optimizer_G'):
+                for param_group in model.optimizer_G.param_groups:
+                    param_group['lr'] *= 0.1
+            elif hasattr(model, 'optimizer'):
+                 for param_group in model.optimizer.param_groups:
+                    param_group['lr'] *= 0.1
+        # ------------------------------
         
         if scheduler_G:
              logger.info(f"Epoch {epoch} LR: {[f'{lr:.2e}' for lr in scheduler_G.get_last_lr()]}")
+
+        if should_run_diag and args.diag_interval_epochs > 0 and (epoch + 1) % args.diag_interval_epochs == 0:
+            try:
+                data_batch = next(iter(train_loader))
+                if args.channels_last:
+                    data_batch = (
+                        data_batch[0].to(model.device, non_blocking=True).to(memory_format=torch.channels_last),
+                        data_batch[1].to(model.device, non_blocking=True),
+                        data_batch[2].to(model.device, non_blocking=True),
+                    )
+                else:
+                    data_batch = (
+                        data_batch[0].to(model.device, non_blocking=True),
+                        data_batch[1].to(model.device, non_blocking=True),
+                        data_batch[2].to(model.device, non_blocking=True),
+                    )
+                update_dual_stream_diag_report(
+                    model=model,
+                    batch=data_batch,
+                    args=args,
+                    logger=logger,
+                    output_dir=os.path.join(writer.file_writer.get_logdir(), args.diag_output),
+                    step=total_steps,
+                    epoch=epoch,
+                )
+            except Exception:
+                pass
 
         if should_stop:
             break

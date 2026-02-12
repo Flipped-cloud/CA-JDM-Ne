@@ -20,6 +20,7 @@ from model.discriminator import (
     Discriminator_joint,
 )
 from model.losses import WingLoss
+from model.heads import ArcMarginProduct
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,6 +80,7 @@ class CAJDMNetModel(BaseModel):
                 use_se=getattr(self.args, 'use_se', False),
                 e_ratio=getattr(self.args, "e_ratio", 0.2),
                 scam_kernel=getattr(self.args, "scam_kernel", 7),
+                align_dim=getattr(self.args, "align_dim", None),
             ).to(self.device)
 
             # Load dual pretrained weights
@@ -87,10 +89,22 @@ class CAJDMNetModel(BaseModel):
                 fld_path=fld_path,
             )
 
-            # Separate output heads on top of fer_embedding (512-d)
+            # classification head
+            self.use_arcface = bool(getattr(args, "use_arcface", False))
+            if self.use_arcface:
+                self.c_layer = ArcMarginProduct(
+                    in_features=self.args.fc_layer,
+                    out_features=self.latent_dim,
+                    s=float(getattr(self.args, "arc_s", 30.0)),
+                    m=float(getattr(self.args, "arc_m", 0.5)),
+                    easy_margin=False,
+                ).to(self.device)
+            else:
+                self.c_layer = torch.nn.Linear(self.args.fc_layer, self.latent_dim).to(self.device)
+
+            # z0 (VAE) heads: dual_stream encoder returns only fer embedding, so we build mu/logvar here
             self.mean_layer = torch.nn.Linear(self.args.fc_layer, self.args.noise_dim).to(self.device)
             self.logvar_layer = torch.nn.Linear(self.args.fc_layer, self.args.noise_dim).to(self.device)
-            self.c_layer = torch.nn.Linear(self.args.fc_layer, self.latent_dim).to(self.device)
 
         elif self.backbone_type == 'ir50':
             self.encoder = IR50_Encoder(
@@ -167,19 +181,48 @@ class CAJDMNetModel(BaseModel):
                 in_channels=512 * 3
             ).to(self.device)
 
-            # Build G parameter groups
-            g_param_groups = [
-                {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": self.args.lr * 0.1},
-                {"params": [p for n, p in self.decoder.named_parameters() if p.requires_grad], "lr": self.args.lr},
-            ]
-            # dual_stream has separate output heads
+            # Build G parameter groups (make FER lr multiplier configurable)
             if self.backbone_type == 'dual_stream':
-                g_param_groups.append(
+                fer_lr_mult = float(getattr(self.args, "fer_lr_mult", 0.2))
+
+                fer_params, fld_params, attn_params, other_enc_params = [], [], [], []
+                for n, p in self.encoder.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if n.startswith("fer_") or n.startswith("fer_input_layer") or n.startswith("fer_layer") or n.startswith("fer_output_layer"):
+                        fer_params.append(p)
+                    elif n.startswith("fld_backbone"):
+                        fld_params.append(p)
+                    elif n.startswith("attn"):
+                        attn_params.append(p)
+                    else:
+                        other_enc_params.append(p)
+
+                enc_groups = []
+                if fer_params:
+                    # Keep FER LR lower to prevent it from overwhelming others (default 0.2 multiplier)
+                    enc_groups.append({"params": fer_params, "lr": self.args.lr * fer_lr_mult})
+                if fld_params:
+                    enc_groups.append({"params": fld_params, "lr": self.args.lr})
+                if attn_params:
+                    # BOOST Attention LR to 5x base LR to encourage faster alignment learning
+                    enc_groups.append({"params": attn_params, "lr": self.args.lr * 5.0})
+                if other_enc_params:
+                    enc_groups.append({"params": other_enc_params, "lr": self.args.lr})
+
+                g_param_groups = [
+                    *enc_groups,
+                    {"params": [p for n, p in self.decoder.named_parameters() if p.requires_grad], "lr": self.args.lr},
                     {"params": list(self.mean_layer.parameters()) +
                                list(self.logvar_layer.parameters()) +
                                list(self.c_layer.parameters()),
-                     "lr": self.args.lr}
-                )
+                     "lr": self.args.lr},
+                ]
+            else:
+                g_param_groups = [
+                    {"params": [p for n, p in self.encoder.named_parameters() if p.requires_grad], "lr": self.args.lr * 0.1},
+                    {"params": [p for n, p in self.decoder.named_parameters() if p.requires_grad], "lr": self.args.lr},
+                ]
 
             self.optimizer_G = torch.optim.AdamW(
                 g_param_groups,
@@ -207,6 +250,7 @@ class CAJDMNetModel(BaseModel):
             self.criterion_recon = torch.nn.L1Loss().to(self.device)
             smoothing = float(getattr(self.args, "label_smoothing", 0.0))
             self.criterion_class = LabelSmoothingCrossEntropy(smoothing=smoothing).to(self.device)
+            self.criterion_align = torch.nn.CosineEmbeddingLoss().to(self.device)
 
     def set_input(self, data):
         self.img = data[0].to(self.device)
@@ -225,36 +269,72 @@ class CAJDMNetModel(BaseModel):
 
     def forward_G(self, epoch):
         if self.backbone_type == 'dual_stream':
-            # Dual-stream encoder returns (fer_embedding, fld_output)
-            fer_embed, fld_pred = self.encoder(self.img)
+            # Dual-stream encoder returns (fer_embedding, fld_output[, align_feats])
+            lambda_align = float(getattr(self.args, "lambda_align", 0.0))
+            if lambda_align > 0:
+                fer_embed, fld_pred, align_feats = self.encoder(self.img, return_feats=True)
+                self.align_feats = align_feats
+            else:
+                fer_embed, fld_pred = self.encoder(self.img)
+                self.align_feats = None
             # fer_embed: (B, 512);  fld_pred: (B, 136)
             self.mean = self.mean_layer(fer_embed)
             self.logvar = self.logvar_layer(fer_embed)
             self.z0_enc = self._sample_z(self.mean, self.logvar)
-            self.z1_enc = self.c_layer(fer_embed)  # emotion logits
-            self.lmk_pred = fld_pred
+
+            # FIX: CAJDMNetModel has no self.training; optimize_params() calls forward_G only in training.
+            if self.use_arcface:
+                # training logits (with margin) for CE loss
+                self.z1_enc = self.c_layer(fer_embed, self.exp_lbl)
+                # margin-free logits for probabilities / decoder conditioning
+                z1_for_prob = self.c_layer(fer_embed, None)
+            else:
+                self.z1_enc = self.c_layer(fer_embed)
+                z1_for_prob = self.z1_enc
+
+            self.lmk_pred = torch.sigmoid(fld_pred)
+
         else:
             # IR50_Encoder / legacy Encoder: returns 5 values
             self.mean, self.logvar, self.z0_enc, self.z1_enc, self.lmk_enc = self.encoder(self.img)
             self.lmk_pred = self.lmk_enc                         # (B,136)
+            z1_for_prob = self.z1_enc
 
-        self.emo_prob = F.softmax(self.z1_enc, dim=1)        # (B,C)
+        self.emo_prob = F.softmax(z1_for_prob, dim=1)        # (B,C)
         self.dec_img = self.decoder(torch.cat([self.z0_enc, self.emo_prob, self.lmk_pred], dim=1))
 
     def backward_G(self, epoch):
-        # supervised
         self.loss_class = self.criterion_class(self.z1_enc, self.exp_lbl)
 
         lmk_tgt = self.landmarks.view(self.batch_size, -1)
         self.loss_lmk = self.criterion_lmk(self.lmk_pred, lmk_tgt)
 
-        # VAE KL
-        self.loss_kl = -0.5 * torch.mean(1 + self.logvar - self.mean.pow(2) - self.logvar.exp())
+        # optional cross-stream alignment loss (dual_stream only)
+        lambda_align = float(getattr(self.args, "lambda_align", 0.0))
+        if lambda_align > 0 and getattr(self, "align_feats", None):
+            align_losses = []
+            for fer_vec, fld_vec in self.align_feats:
+                target = torch.ones(fer_vec.size(0), device=fer_vec.device)
+                align_losses.append(self.criterion_align(fer_vec, fld_vec, target))
+            self.loss_align = torch.stack(align_losses).mean()
+        else:
+            self.loss_align = torch.tensor(0.0, device=self.device)
 
-        # reconstruction
-        self.loss_recon = self.criterion_recon(self.dec_img, self.img)
+        # KL / recon warmup (critical on RAF)
+        kl_start = int(getattr(self.args, "kl_start_epoch", 10))
+        recon_start = int(getattr(self.args, "recon_start_epoch", 10))
 
-        # adversarial (only after gan_start_epoch)
+        if epoch >= kl_start:
+            self.loss_kl = -0.5 * torch.mean(1 + self.logvar - self.mean.pow(2) - self.logvar.exp())
+        else:
+            self.loss_kl = torch.tensor(0.0, device=self.device)
+
+        if epoch >= recon_start:
+            self.loss_recon = self.criterion_recon(self.dec_img, self.img)
+        else:
+            self.loss_recon = torch.tensor(0.0, device=self.device)
+
+        # adversarial
         self.loss_gan = torch.tensor(0.0, device=self.device)
 
         if epoch >= self.args.gan_start_epoch:
@@ -307,6 +387,7 @@ class CAJDMNetModel(BaseModel):
             + self.args.lambda_kl * self.loss_kl
             + self.args.lambda_recon * self.loss_recon
             + self.args.lambda_gan * self.loss_gan
+            + lambda_align * self.loss_align
         )
         self.loss_G.backward()
 
@@ -409,4 +490,13 @@ class CAJDMNetModel(BaseModel):
             self.optimizer_G.zero_grad(set_to_none=True)
             self.forward_G(epoch)
             self.backward_G(epoch)
+            
+            # --- Gradient Clipping (Solution 1) ---
+            grad_clip = getattr(self.args, "grad_clip", 5.0)
+            if grad_clip > 0:
+                # Clip gradients for all trainable G parameters
+                params_to_clip = [p for group in self.optimizer_G.param_groups for p in group['params']]
+                torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip)
+            # --------------------------------------
+
             self.optimizer_G.step()

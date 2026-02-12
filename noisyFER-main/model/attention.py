@@ -153,12 +153,20 @@ class CCAM(nn.Module):
     - 按论文分别沿不同维度 softmax 并求和得到 A_e / A_l
     - 输出两路加权后的特征 (x_face', x_land')
     """
-    def __init__(self, channel: int, e_ratio: float = 0.2):
+    def __init__(self, channel: int, e_ratio: float = 0.2, spatial_hw=None):
         super().__init__()
         self.e_ratio = e_ratio
         # 按空间尺寸缓存 MLP，避免每次 forward 重新构建
         self.face_mlps = nn.ModuleDict()
         self.land_mlps = nn.ModuleDict()
+
+        if spatial_hw is not None:
+            for hw in spatial_hw:
+                key = str(int(hw))
+                if key not in self.face_mlps:
+                    self.face_mlps[key] = self._build_mlp(int(hw))
+                if key not in self.land_mlps:
+                    self.land_mlps[key] = self._build_mlp(int(hw))
 
     def _build_mlp(self, in_feature: int):
         out_feature = max(1, int(in_feature * self.e_ratio))
@@ -301,7 +309,7 @@ class HeteroCoAttentionModule(nn.Module):
     CCAM (channel correlation) and SCAM (spatial co-attention). The two
     attended FER features are blended with learnable weights and a residual.
     """
-    def __init__(self, fer_channels: int, fld_channels: int, e_ratio: float = 0.2, scam_kernel: int = 7):
+    def __init__(self, fer_channels: int, fld_channels: int, e_ratio: float = 0.2, scam_kernel: int = 7, spatial_size: int = None):
         super().__init__()
         self.fer_channels = fer_channels
         self.fld_channels = fld_channels
@@ -321,7 +329,10 @@ class HeteroCoAttentionModule(nn.Module):
             self.fld_to_fer = nn.Identity()
             self.fer_to_fld = nn.Identity()
 
-        self.ccam = CCAM(fer_channels, e_ratio=e_ratio)
+        spatial_hw = None
+        if spatial_size is not None:
+            spatial_hw = [int(spatial_size) * int(spatial_size)]
+        self.ccam = CCAM(fer_channels, e_ratio=e_ratio, spatial_hw=spatial_hw)
         self.scam = SCAM(fer_channels, kernel_size=scam_kernel)
 
         # CCAM/SCAM 内部融合权重

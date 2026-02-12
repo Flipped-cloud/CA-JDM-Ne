@@ -1,0 +1,11 @@
+python train_ca_jdm_net.py \
+  --backbone dual_stream --model_type ca_jdm \
+  --use_arcface --arc_s 30 --arc_m 0.5 \
+  --kl_start_epoch 15 --recon_start_epoch 15 --fer_lr_mult 0.5 \
+  --no_class_balance --label_smoothing 0.05 \
+  --lambda_align 0.5 --align_dim 256 \
+  --enable_dual_stream_diag --diag_output dual_stream_diagnostics --diag_max_batches 5 --diag_interval_steps 200 \
+  --grad_clip 5.0 \
+  --lambda_exp 0.1 --lambda_lmk 2.0 \
+  --lr 0.00005 \
+  --freeze_fld_epoch 15 --step_decay_epoch 20
