@@ -102,6 +102,7 @@ def validate_model(model, test_loader, args):
 
     correct = 0
     total = 0
+    use_tta = bool(getattr(args, "val_tta", False))
     
     with torch.inference_mode():
         for data_val in tqdm(test_loader):
@@ -120,13 +121,31 @@ def validate_model(model, test_loader, args):
                         z1_enc = model.c_layer(fer_embed, None)
                     else:
                         z1_enc = model.c_layer(fer_embed)
+
+                    if use_tta:
+                        img_flip = torch.flip(img, dims=[3])
+                        fer_embed_flip, _ = model.encoder(img_flip)
+                        if getattr(model, "use_arcface", False):
+                            z1_flip = model.c_layer(fer_embed_flip, None)
+                        else:
+                            z1_flip = model.c_layer(fer_embed_flip)
+                        z1_enc = 0.5 * (z1_enc + z1_flip)
                 else:
                     # 传统架构 encoder 直接输出 5 个值，取第 4 个
                     _, _, _, z1_enc, _ = model.encoder(img)
+                    if use_tta:
+                        img_flip = torch.flip(img, dims=[3])
+                        _, _, _, z1_flip, _ = model.encoder(img_flip)
+                        z1_enc = 0.5 * (z1_enc + z1_flip)
                 _, predicted = z1_enc.max(1)
             elif args.model_type == "single_task":
                 _, _, _, z1, _ = model.encoder(img)
                 pred = model.classifier(z1)
+                if use_tta:
+                    img_flip = torch.flip(img, dims=[3])
+                    _, _, _, z1_flip, _ = model.encoder(img_flip)
+                    pred_flip = model.classifier(z1_flip)
+                    pred = 0.5 * (pred + pred_flip)
                 _, predicted = pred.max(1)
             elif args.model_type == "multi_task":
                 # Assuming MultiTaskModel has similar interface
@@ -154,9 +173,9 @@ def parse_args():
     parser.add_argument("--img_size", default=112, type=int)
     parser.add_argument("--num_epoch", default=150, type=int)
     parser.add_argument("--log_step", default=50, type=int)
-    parser.add_argument("--val_step", default=200, type=int)
+    parser.add_argument("--val_step", default=100, type=int)
     parser.add_argument("--save_step", default=500, type=int)
-    parser.add_argument("--early_stop_patience", default=15, type=int) # Increase patience from 10 to 20
+    parser.add_argument("--early_stop_patience", default=20, type=int) # Increase patience from 10 to 20
     parser.add_argument("--isTrain", default=True, type=bool)
     parser.add_argument("--fc_layer", default=512, type=int)
     parser.add_argument("--noise_dim", default=100, type=int)
@@ -178,7 +197,13 @@ def parse_args():
     parser.add_argument("--lambda_fer", default=0.5, type=float, help="Use this instead of lambda_exp for clarity if desired")
     parser.add_argument("--grad_clip", default=5.0, type=float, help="Max norm for gradient clipping")
     parser.add_argument("--step_decay_epoch", default=10, type=int, help="Epoch to aggressively decay LR by 0.1")
+    parser.add_argument("--disable_aggressive_decay", action="store_true", help="Disable the one-shot 0.1 LR decay at step_decay_epoch")
     parser.add_argument("--freeze_fld_epoch", default=15, type=int, help="Epoch to freeze FLD branch (Delayed to allow alignment)")
+    parser.add_argument("--lambda_exp_after_freeze", default=0.25, type=float,
+                       help="FER loss weight after FLD freeze (dual_stream)")
+    parser.add_argument("--lambda_lmk_after_freeze", default=1.5, type=float,
+                       help="Landmark loss weight after FLD freeze (dual_stream)")
+    parser.add_argument("--val_tta", action="store_true", help="Enable horizontal-flip TTA in validation")
 
     parser.add_argument("--lambda_sx", default=1.0, type=float)
     parser.add_argument("--lambda_sz0", default=1.0, type=float)
@@ -200,7 +225,7 @@ def parse_args():
 
     parser.add_argument("--save_dir", default="runs_ca_jdm", type=str)
     parser.add_argument("--dataset", default="raf", type=str, choices=["raf", "affectnet"])
-    parser.add_argument("--seed", default=326, type=int)
+    parser.add_argument("--seed", default=15, type=int)
 
     # Regularization / augmentation
     parser.add_argument("--label_smoothing", default=0.05, type=float)
@@ -222,9 +247,9 @@ def parse_args():
                        help="Path to IR50 pretrained weights for dual_stream")
     parser.add_argument("--fld_pretrained_path", default="checkpoints/mobilefacenet_model_best.pth", type=str,
                        help="Path to MobileFaceNet pretrained weights for dual_stream")
-    parser.add_argument("--resume_seed", default=326, type=int,
+    parser.add_argument("--resume_seed", default=15, type=int,
                        help="If set, load best model from runs directory of this seed and resume training from its weights")
-    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/326", type=str,
+    parser.add_argument("--resume_path", default="/root/autodl-tmp/CA-JDM-Ne/noisyFER-main/runs_ca_jdm/15", type=str,
                        help="If set, load weights from this file (single file) or directory (will search for best files)")
     # parser.add_argument("--use_dual_stream", action="store_true", help="Use dual-stream attention (default: single-stream CBAM)")
     parser.add_argument("--no_dual_stream", action="store_true", help="Disable dual-stream attention")
@@ -437,16 +462,34 @@ def train(writer, logger, args):
         else:
             resume_dir = None
 
+    def _load_ca_jdm_best_from_dir(resume_dir_path):
+        loaded_any = False
+        module_to_file = {
+            "encoder": "best_net_encoder.pth",
+            "decoder": "best_net_decoder.pth",
+            "discriminator_x": "best_net_discriminator_x.pth",
+            "discriminator_z0": "best_net_discriminator_z0.pth",
+            "discriminator_emo": "best_net_discriminator_emo.pth",
+            "discriminator_lmk": "best_net_discriminator_lmk.pth",
+            "discriminator_joint_xz": "best_net_discriminator_joint_xz.pth",
+            "c_layer": "best_net_c_layer.pth",
+            "mean_layer": "best_net_mean_layer.pth",
+            "logvar_layer": "best_net_logvar_layer.pth",
+        }
+        for module_name, filename in module_to_file.items():
+            module = getattr(model, module_name, None)
+            if module is None:
+                continue
+            ckpt_path = os.path.join(resume_dir_path, filename)
+            if os.path.isfile(ckpt_path):
+                ok = _try_load_state_dict(module, ckpt_path, module_name)
+                loaded_any = loaded_any or ok
+        return loaded_any
+
     # If we have a resume directory, try common filenames and model-specific loader
     if not resumed and resume_dir:
-        # Prefer model's own loader if available
-        if hasattr(model, 'load_networks'):
-            try:
-                model.load_networks("best", resume_dir)
-                logger.info(f"Loaded networks via model.load_networks from {resume_dir}")
-                resumed = True
-            except Exception as e:
-                logger.warning(f"model.load_networks failed: {e}")
+        if args.model_type == "ca_jdm":
+            resumed = _load_ca_jdm_best_from_dir(resume_dir)
 
         # Try common files
         if not resumed:
@@ -470,6 +513,16 @@ def train(writer, logger, args):
             for p in cls_candidates:
                 if os.path.isfile(p) and hasattr(model, 'classifier'):
                     _try_load_state_dict(model.classifier, p, 'classifier')
+
+        if not resumed and args.model_type == "ca_jdm" and hasattr(model, "c_layer"):
+            c_layer_candidates = [
+                os.path.join(resume_dir, 'best_c_layer.pth'),
+                os.path.join(resume_dir, 'best_classifier.pth'),
+            ]
+            for p in c_layer_candidates:
+                if os.path.isfile(p) and _try_load_state_dict(model.c_layer, p, 'c_layer'):
+                    resumed = True
+                    break
 
     # Finally, if not resumed and user requested pretrained backbone, load pretrained weights
     if not resumed and args.use_pretrained and hasattr(model, 'encoder') and hasattr(model.encoder, 'load_pretrained_weights'):
@@ -586,7 +639,7 @@ def train(writer, logger, args):
             scheduler_D.step()
 
         # --- Aggressive Decay logic ---
-        if epoch + 1 == args.step_decay_epoch:
+        if (not args.disable_aggressive_decay) and epoch + 1 == args.step_decay_epoch:
             logger.info("Aggressive LR Decay: multiplying all LRs by 0.1")
             if hasattr(model, 'optimizer_G'):
                 for param_group in model.optimizer_G.param_groups:

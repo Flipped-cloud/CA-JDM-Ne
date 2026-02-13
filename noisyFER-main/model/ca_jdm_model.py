@@ -250,7 +250,8 @@ class CAJDMNetModel(BaseModel):
             self.criterion_recon = torch.nn.L1Loss().to(self.device)
             smoothing = float(getattr(self.args, "label_smoothing", 0.0))
             self.criterion_class = LabelSmoothingCrossEntropy(smoothing=smoothing).to(self.device)
-            self.criterion_align = torch.nn.CosineEmbeddingLoss().to(self.device)
+            # [Method 4] Use MSE for Spatial Map Alignment
+            self.criterion_align = torch.nn.MSELoss().to(self.device)
 
     def set_input(self, data):
         self.img = data[0].to(self.device)
@@ -313,9 +314,11 @@ class CAJDMNetModel(BaseModel):
         lambda_align = float(getattr(self.args, "lambda_align", 0.0))
         if lambda_align > 0 and getattr(self, "align_feats", None):
             align_losses = []
-            for fer_vec, fld_vec in self.align_feats:
-                target = torch.ones(fer_vec.size(0), device=fer_vec.device)
-                align_losses.append(self.criterion_align(fer_vec, fld_vec, target))
+            for fer_map, fld_map in self.align_feats:
+                # [Method 4: Spatial Relaxed Alignment] 
+                # Align spatial attention maps using MSE. 
+                # Detach FER to treat it as the "Teacher" for FLD.
+                align_losses.append(self.criterion_align(fld_map, fer_map.detach()))
             self.loss_align = torch.stack(align_losses).mean()
         else:
             self.loss_align = torch.tensor(0.0, device=self.device)
@@ -380,16 +383,39 @@ class CAJDMNetModel(BaseModel):
                 + self.args.lambda_sxz * loss_g_sxz
             )
 
+        # rebalance FER/LMK objectives after FLD branch is frozen (dual_stream)
+        lambda_exp = float(getattr(self.args, "lambda_exp", 0.1))
+        lambda_lmk = float(getattr(self.args, "lambda_lmk", 2.0))
+        freeze_fld_epoch = int(getattr(self.args, "freeze_fld_epoch", 15))
+        if self.backbone_type == 'dual_stream' and epoch >= freeze_fld_epoch:
+            lambda_exp = float(getattr(self.args, "lambda_exp_after_freeze", lambda_exp))
+            lambda_lmk = float(getattr(self.args, "lambda_lmk_after_freeze", lambda_lmk))
+
         # total G loss
         self.loss_G = (
-            self.args.lambda_exp * self.loss_class
-            + self.args.lambda_lmk * self.loss_lmk
+            lambda_exp * self.loss_class
+            + lambda_lmk * self.loss_lmk
             + self.args.lambda_kl * self.loss_kl
             + self.args.lambda_recon * self.loss_recon
             + self.args.lambda_gan * self.loss_gan
             + lambda_align * self.loss_align
         )
         self.loss_G.backward()
+
+    def save_networks(self, epoch, logdir):
+        super(CAJDMNetModel, self).save_networks(epoch, logdir)
+        extra_modules = ["c_layer", "mean_layer", "logvar_layer"]
+        for name in extra_modules:
+            if not hasattr(self, name):
+                continue
+            module = getattr(self, name)
+            save_filename = '%s_net_%s.pth' % (epoch, name)
+            save_path = os.path.join(logdir, save_filename)
+            if torch.cuda.is_available():
+                torch.save(module.cpu().state_dict(), save_path)
+                module.to(device)
+            else:
+                torch.save(module.cpu().state_dict(), save_path)
 
     def backward_D(self):
         lmk_tgt = self.landmarks.view(self.batch_size, -1)

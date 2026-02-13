@@ -332,8 +332,13 @@ class HeteroCoAttentionModule(nn.Module):
         spatial_hw = None
         if spatial_size is not None:
             spatial_hw = [int(spatial_size) * int(spatial_size)]
+        
         self.ccam = CCAM(fer_channels, e_ratio=e_ratio, spatial_hw=spatial_hw)
         self.scam = SCAM(fer_channels, kernel_size=scam_kernel)
+
+        # [Method 4] Independent Spatial Attention for Alignment
+        self.sa_fer = SpatialAttention(kernel_size=scam_kernel)
+        self.sa_fld = SpatialAttention(kernel_size=scam_kernel)
 
         # CCAM/SCAM 内部融合权重
         self.alpha_f = nn.Parameter(torch.FloatTensor([0.5, 0.5]))
@@ -343,8 +348,21 @@ class HeteroCoAttentionModule(nn.Module):
         self.cs = nn.Parameter(torch.tensor([[1.0, 0.0],
                                              [0.0, 1.0]], dtype=torch.float32))
 
-    def forward(self, f_fer: torch.Tensor, f_fld: torch.Tensor) -> torch.Tensor:
+    def forward(self, f_fer: torch.Tensor, f_fld: torch.Tensor):
         f_fld_aligned = self.fld_to_fer(f_fld)
+
+        # [Method 4] Compute separate spatial attention maps for alignment
+        # Use Activation Energy (mean squared) as a robust proxy for spatial attention
+        # since we want to align "where natural attention is" without extra learnable parameters.
+        # (B, C, H, W) -> (B, 1, H, W)
+        mask_fer = torch.mean(f_fer.pow(2), dim=1, keepdim=True)
+        mask_fld = torch.mean(f_fld_aligned.pow(2), dim=1, keepdim=True)
+        
+        # L2 Normalize the spatial maps to make alignment scale-invariant
+        # This ensures we align the "shape" of attention, not the magnitude.
+        B, _, H, W = mask_fer.shape
+        mask_fer = F.normalize(mask_fer.view(B, -1), dim=1).view(B, 1, H, W)
+        mask_fld = F.normalize(mask_fld.view(B, -1), dim=1).view(B, 1, H, W)
 
         f_ccam, l_ccam = self.ccam(f_fer, f_fld_aligned)
         f_scam, l_scam = self.scam(f_fer, f_fld_aligned)
@@ -364,4 +382,4 @@ class HeteroCoAttentionModule(nn.Module):
         out_fld_aligned = l_mix + f_fld_aligned
         out_fld = self.fer_to_fld(out_fld_aligned)
 
-        return out_fer, out_fld
+        return out_fer, out_fld, mask_fer, mask_fld

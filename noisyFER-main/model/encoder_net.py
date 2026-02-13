@@ -674,56 +674,11 @@ class Encoder_Net(nn.Module):
         self.attn3 = HeteroCoAttentionModule(fer_channels=256, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s3)
         self.attn4 = HeteroCoAttentionModule(fer_channels=512, fld_channels=128, e_ratio=e_ratio, scam_kernel=scam_kernel, spatial_size=s4)
 
-        # Optional alignment projections for cross-stream feature alignment loss
-        self.align_dim = align_dim
-        if align_dim is not None and align_dim > 0:
-            self.fer_align = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(256, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(512, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-            ])
-            self.fld_align = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(64, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-                nn.Sequential(
-                    nn.Conv2d(128, align_dim, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(align_dim),
-                    nn.ReLU(inplace=True),
-                ),
-            ])
-        else:
-            self.fer_align = None
-            self.fld_align = None
+        # [Method 4] Attention Map Alignment
+        # We assume attention masks are returned by HeteroCoAttentionModule directly.
+        # No extra projection heads needed.
+        self.fer_align = None
+        self.fld_align = None
 
         # =================================================================
         # FER Output Head: BN -> Dropout -> Flatten -> FC -> BN  (=> 512-d)
@@ -866,41 +821,33 @@ class Encoder_Net(nn.Module):
 
         # Stage 1
         fer_x = self.fer_layer1(fer_x)         # (B, 64, 56, 56)
-        fer_x, fld_x = self.attn1(fer_x, fld_x)
-        if return_feats and self.fer_align is not None and self.fld_align is not None:
-            fer_vec = F.adaptive_avg_pool2d(self.fer_align[0](fer_x), 1).flatten(1)
-            fld_vec = F.adaptive_avg_pool2d(self.fld_align[0](fld_x), 1).flatten(1)
-            align_feats.append((fer_vec, fld_vec))
+        fer_x, fld_x, m_fer1, m_fld1 = self.attn1(fer_x, fld_x)
+        if return_feats:
+            align_feats.append((m_fer1, m_fld1))
 
         # Stage 2
         fld_x = self.fld_backbone.conv_23(fld_x)
         fld_x = self.fld_backbone.conv_3(fld_x)  # (B, 64, 28, 28)
         fer_x = self.fer_layer2(fer_x)           # (B, 128, 28, 28)
-        fer_x, fld_x = self.attn2(fer_x, fld_x)
-        if return_feats and self.fer_align is not None and self.fld_align is not None:
-            fer_vec = F.adaptive_avg_pool2d(self.fer_align[1](fer_x), 1).flatten(1)
-            fld_vec = F.adaptive_avg_pool2d(self.fld_align[1](fld_x), 1).flatten(1)
-            align_feats.append((fer_vec, fld_vec))
+        fer_x, fld_x, m_fer2, m_fld2 = self.attn2(fer_x, fld_x)
+        if return_feats:
+            align_feats.append((m_fer2, m_fld2))
 
         # Stage 3
         fld_x = self.fld_backbone.conv_34(fld_x)
         fld_x = self.fld_backbone.conv_4(fld_x)  # (B, 128, 14, 14)
         fer_x = self.fer_layer3(fer_x)           # (B, 256, 14, 14)
-        fer_x, fld_x = self.attn3(fer_x, fld_x)
-        if return_feats and self.fer_align is not None and self.fld_align is not None:
-            fer_vec = F.adaptive_avg_pool2d(self.fer_align[2](fer_x), 1).flatten(1)
-            fld_vec = F.adaptive_avg_pool2d(self.fld_align[2](fld_x), 1).flatten(1)
-            align_feats.append((fer_vec, fld_vec))
+        fer_x, fld_x, m_fer3, m_fld3 = self.attn3(fer_x, fld_x)
+        if return_feats:
+            align_feats.append((m_fer3, m_fld3))
 
         # Stage 4
         fld_x = self.fld_backbone.conv_45(fld_x)
         fld_x = self.fld_backbone.conv_5(fld_x)  # (B, 128, 7, 7)
         fer_x = self.fer_layer4(fer_x)           # (B, 512, 7, 7)
-        fer_x, fld_x = self.attn4(fer_x, fld_x)
-        if return_feats and self.fer_align is not None and self.fld_align is not None:
-            fer_vec = F.adaptive_avg_pool2d(self.fer_align[3](fer_x), 1).flatten(1)
-            fld_vec = F.adaptive_avg_pool2d(self.fld_align[3](fld_x), 1).flatten(1)
-            align_feats.append((fer_vec, fld_vec))
+        fer_x, fld_x, m_fer4, m_fld4 = self.attn4(fer_x, fld_x)
+        if return_feats:
+            align_feats.append((m_fer4, m_fld4))
 
         # FLD embedding head
         fld_x = self.fld_backbone.conv_6_sep(fld_x)
